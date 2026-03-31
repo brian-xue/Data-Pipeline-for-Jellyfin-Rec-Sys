@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ${POSTGRES_DATA_PATH:-./local_data/postgres}:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ${OBJECT_STORE_PATH:-./local_data/minio}:/data
+
+  api:
+    build:
+      context: ./api
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${ARTIFACTS_PATH:-./local_data/artifacts}:/data/artifacts
+
+  pipeline:
+    build:
+      context: ./pipeline
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+      - minio
+    volumes:
+      - ${WAREHOUSE_PATH:-./local_data/warehouse}:/data/warehouse
+      - ${ARTIFACTS_PATH:-./local_data/artifacts}:/data/artifacts
+      - ${OBJECT_STORE_PATH:-./local_data/minio}:${OBJECT_STORE_MOUNT:-/mnt/object}
+      - ${BLOCK_PATH:-/mnt/block}:/mnt/block
+    command: /bin/sh -lc ". /opt/venvs/pipeline/bin/activate && python scripts/ingest_datasets.py"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      MINIO_ENDPOINT: minio:9000
+      OBJECT_STORE_MOUNT: ${OBJECT_STORE_MOUNT:-/mnt/object}
+
+
+  simulator:
+    build:
+      context: ./simulator
+    env_file:
+      - .env
+    depends_on:
+      - api
+      - postgres

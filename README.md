@@ -1,1 +1,2 @@
 # Data-Pipeline-for-Jellyfin-Rec-Sys
+This repository contains a data pipeline for a recommendation system using the Jellyfin dataset. The pipeline is designed to ingest, process, and store data in a structured format for further analysis and model training.

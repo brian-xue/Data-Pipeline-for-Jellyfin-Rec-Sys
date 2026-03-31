@@ -1,0 +1,9 @@
+pandas
+pyarrow
+boto3
+requests
+kaggle
+python-dotenv
+numpy
+tqdm
+sentence-transformers
