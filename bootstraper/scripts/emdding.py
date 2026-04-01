@@ -30,9 +30,9 @@ BATCH_SIZE = 256
 # Higher weight = stronger contribution to final movie vector
 # ============================================================
 FIELD_WEIGHTS: dict[str, float] = {
-    "overview": 0.40,
+    "overview": 0.25,
     "keywords_list": 0.20,
-    "genres_list": 0.15,
+    "genres_list": 0.30,
     "top_user_tags": 0.10,
     "tagline": 0.05,
     "title": 0.04,
@@ -42,7 +42,7 @@ FIELD_WEIGHTS: dict[str, float] = {
     "spoken_languages_list": 0.01,
     "original_language": 0.003,
     "adult": 0.001,
-    "release_year": 0.001,
+    "release_year": 0.05,
 }
 
 # Metadata to keep in output
