@@ -1,0 +1,50 @@
+job:
+  name: bootstrap_base_users
+  profile_version: bootstraper_v0_embedding
+
+input:
+  ratings_path: /data/raw/ratings.csv
+  movie_embedding_path: /data/embedding/movie_embedding.parquet
+  chunksize: 200000
+
+cleaning:
+  allowed_rating_min: 0.5
+  allowed_rating_max: 5.0
+  drop_invalid_rows: true
+
+filter:
+  min_interactions_per_user: 5
+
+bootstrap:
+  ratio: 0.7
+  min_bootstrap_interactions: 3
+  min_remaining_interactions: 1
+  deduplicate_user_movie: false
+
+profile:
+  positive_rating_threshold: 4.0
+  recent_k: 10
+  half_life_days: 180
+  preference_anchor_rating: 3.5
+  min_positive_weight_sum: 1e-8
+
+output:
+  base_dir: /data/artifacts/bootstraper_v0_embedding
+  write_parquet: true
+
+iceberg:
+  enabled: false
+  catalog_name: default
+  namespace: recsys
+  tables:
+    base_user_events: base_user_events
+    base_users: base_users
+    base_user_profiles: base_user_profiles
+    remaining_user_events: remaining_user_events
+  append_batch_rows: 50000
+
+artifact:
+  manifest_path: /data/artifacts/bootstraper_v0_embedding/manifest.json
+
+logging:
+  log_every_users: 5000

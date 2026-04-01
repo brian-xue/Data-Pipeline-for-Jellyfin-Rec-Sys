@@ -1,0 +1,12 @@
+pandas
+pyarrow
+boto3
+requests
+kaggle
+python-dotenv
+numpy
+tqdm
+sentence-transformers
+pyyaml
+pyiceberg[s3fs,sql-postgres]
+psycopg2-binary

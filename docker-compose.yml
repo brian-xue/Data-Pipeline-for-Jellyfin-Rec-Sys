@@ -1,8 +1,9 @@
 services:
+  # --- INFRASTRUCTURE LAYER ---
   postgres:
     image: postgres:16
-    env_file:
-      - .env
+    container_name: postgres
+    env_file: .env
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -10,60 +11,126 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ${POSTGRES_DATA_PATH:-./local_data/postgres}:/var/lib/postgresql/data
+      - /mnt/block/postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   minio:
     image: minio/minio:latest
-    env_file:
-      - .env
+    container_name: minio
+    env_file: .env
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000" # API
+      - "9001:9001" # Console
     volumes:
-      - ${OBJECT_STORE_PATH:-./local_data/minio}:/data
+      - /mnt/object/minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
-  api:
-    build:
-      context: ./api
-    env_file:
-      - .env
+  # --- INITIALIZATION LAYER ---
+  minio-init:
+    image: minio/mc
+    container_name: minio-init
     depends_on:
-      - postgres
-    ports:
-      - "8000:8000"
-    volumes:
-      - ${ARTIFACTS_PATH:-./local_data/artifacts}:/data/artifacts
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+      mc mb --ignore-existing myminio/warehouse;
+      mc mb --ignore-existing myminio/raw;
+      exit 0;
+      "
 
-  pipeline:
-    build:
-      context: ./pipeline
-    env_file:
-      - .env
+  # --- DATA ENGINEERING LAYER ---
+  bootstrapper:
+    build: ./bootstraper
+    container_name: bootstraper
+    env_file: .env
     depends_on:
-      - postgres
-      - minio
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     volumes:
-      - ${WAREHOUSE_PATH:-./local_data/warehouse}:/data/warehouse
-      - ${ARTIFACTS_PATH:-./local_data/artifacts}:/data/artifacts
-      - ${OBJECT_STORE_PATH:-./local_data/minio}:${OBJECT_STORE_MOUNT:-/mnt/object}
-      - ${BLOCK_PATH:-/mnt/block}:/mnt/block
-    command: /bin/sh -lc ". /opt/venvs/pipeline/bin/activate && python scripts/ingest_datasets.py"
+      - /mnt/object/artifacts:/data/artifacts
+      - /mnt/object/raw:/data/raw
+      - ./bootstraper:/app
+      - /mnt/object/bucket/embedding:/data/embedding
+    working_dir: /app
+    command: tail -f /dev/null # Keep alive for manual execution/debug
     environment:
       POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      MINIO_ENDPOINT: minio:9000
-      OBJECT_STORE_MOUNT: ${OBJECT_STORE_MOUNT:-/mnt/object}
+      MINIO_ENDPOINT: http://minio:9000
+      # PyIceberg specific env vars
+      PYICEBERG_CATALOG__DEFAULT__TYPE: sql
+      PYICEBERG_CATALOG__DEFAULT__URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      PYICEBERG_CATALOG__DEFAULT__S3__ENDPOINT: http://minio:9000
+      PYICEBERG_CATALOG__DEFAULT__WAREHOUSE: s3://warehouse/
 
+  pipeline:
+    build: ./pipeline
+    container_name: pipeline
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - /mnt/block/artifacts:/data/artifacts
+      - /mnt/block/cache:/data/cache
+      - ./pipeline:/app
+    working_dir: /app
+    # Execute ingestion script then exit
+    command: >
+      /bin/sh -c "
+      echo 'Starting Incremental Pipeline...';
+      python scripts/ingest_datasets.py
+      "
+    environment:
+      POSTGRES_HOST: postgres
+      MINIO_ENDPOINT: http://minio:9000
+      ARTIFACTS_PATH: /data/artifacts
+
+  # --- APPLICATION LAYER ---
+  api:
+    build: ./api
+    container_name: api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /mnt/block/artifacts:/data/artifacts:ro # Read-only model access
+      - ./api:/app
 
   simulator:
-    build:
-      context: ./simulator
-    env_file:
-      - .env
+    build: ./simulator
+    container_name: simulator
+    env_file: .env
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- OBSERVABILITY LAYER ---
+  adminer:
+    image: adminer
+    container_name: adminer
+    ports:
+      - "5050:8080"
+    depends_on:
       - postgres
