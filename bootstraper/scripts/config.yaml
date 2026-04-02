@@ -3,8 +3,8 @@ job:
   profile_version: bootstraper_v0_embedding
 
 input:
-  ratings_path: /data/raw/ratings.csv
-  movie_embedding_path: /data/embedding/movie_embedding.parquet
+  ratings_path: /data/raw/non_s3/ratings.csv
+  movie_embedding_path: s3://embedding/movie_embeddings.parquet
   chunksize: 200000
 
 cleaning:
@@ -29,7 +29,7 @@ profile:
   min_positive_weight_sum: 1e-8
 
 output:
-  base_dir: /data/artifacts/bootstraper_v0_embedding
+  base_dir: s3://artifacts/bootstraper_v0_embedding
   write_parquet: true
 
 iceberg:
@@ -44,7 +44,7 @@ iceberg:
   append_batch_rows: 50000
 
 artifact:
-  manifest_path: /data/artifacts/bootstraper_v0_embedding/manifest.json
+  manifest_path: s3://artifacts/bootstraper_v0_embedding/manifest.json
 
 logging:
   log_every_users: 5000

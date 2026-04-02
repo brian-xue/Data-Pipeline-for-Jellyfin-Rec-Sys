@@ -1,7 +1,9 @@
 import os
+import gc
 import math
 import json
 import argparse
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +13,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
+
+from minio_s3 import to_s3_uri, upload_bytes_to_path, upload_file_to_path, s3_filesystem
 
 try:
     from pyiceberg.catalog import load_catalog
@@ -34,6 +38,53 @@ def deep_get(d: Dict[str, Any], keys: List[str], default=None):
         cur = cur[k]
     return cur
 
+
+# ============================================================
+# IO
+# ============================================================
+def open_input_binary(path_like: str):
+    path_str = str(path_like).strip()
+    is_s3 = path_str.startswith("s3://")
+
+    if not is_s3 or os.path.exists(path_str):
+        local_path = path_str.replace("s3://", "/data/") if is_s3 else path_str
+        if os.path.exists(local_path) and os.path.isfile(local_path):
+            print(f"[Local IO] Opening physical file: {local_path}")
+            return open(local_path, "rb")
+
+    print(f"[S3 IO] Opening stream via s3fs: {path_str}")
+    fs = s3_filesystem()
+    try:
+        s3_uri = to_s3_uri(path_str)
+    except ValueError:
+        s3_uri = path_str
+
+    return fs.open(
+        s3_uri,
+        "rb",
+        cache_type="readahead",
+        block_size=8 * 1024 * 1024,   # 比原来更保守一点
+    )
+
+
+def csv_chunks_from_input(path_like: str, chunksize: int):
+    with open_input_binary(path_like) as handle:
+        yield from pd.read_csv(
+            handle,
+            chunksize=chunksize,
+            low_memory=False,
+        )
+
+
+def estimate_chunks(path, chunksize):
+    import pandas as pd
+
+    total_rows = 0
+    for chunk in pd.read_csv(path, chunksize=chunksize, usecols=[0]):  # 只读一列
+        total_rows += len(chunk)
+
+    total_chunks = (total_rows + chunksize - 1) // chunksize
+    return total_rows, total_chunks
 
 # ============================================================
 # Arrow schemas
@@ -89,19 +140,49 @@ BASE_USER_PROFILES_SCHEMA = pa.schema([
 
 
 # ============================================================
-# Incremental parquet writer
+# Column-buffer parquet writer
 # ============================================================
-class IncrementalParquetWriter:
-    def __init__(self, path: str, schema: pa.Schema):
+class ColumnBufferParquetWriter:
+    def __init__(self, path: str, schema: pa.Schema, flush_rows: int = 100000):
         self.path = path
         self.schema = schema
+        self.flush_rows = int(flush_rows)
         self.writer: Optional[pq.ParquetWriter] = None
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.buffers: Dict[str, List[Any]] = {field.name: [] for field in schema}
+        self.row_count = 0
 
-    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
-        if not rows:
+    def append_columns(self, cols: Dict[str, List[Any]]) -> None:
+        if not cols:
             return
-        table = rows_to_arrow(rows, self.schema)
+        n = len(next(iter(cols.values()))) if cols else 0
+        if n == 0:
+            return
+
+        for field in self.schema:
+            self.buffers[field.name].extend(cols[field.name])
+
+        self.row_count += n
+        if self.row_count >= self.flush_rows:
+            self.flush()
+
+    def append_one(self, row: Dict[str, Any]) -> None:
+        for field in self.schema:
+            self.buffers[field.name].append(row.get(field.name))
+        self.row_count += 1
+        if self.row_count >= self.flush_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if self.row_count == 0:
+            return
+
+        arrays = {}
+        for field in self.schema:
+            arrays[field.name] = pa.array(self.buffers[field.name], type=field.type)
+
+        table = pa.Table.from_pydict(arrays, schema=self.schema)
+
         if self.writer is None:
             self.writer = pq.ParquetWriter(
                 self.path,
@@ -110,18 +191,18 @@ class IncrementalParquetWriter:
             )
         self.writer.write_table(table)
 
+        for k in self.buffers:
+            self.buffers[k].clear()
+        self.row_count = 0
+
+        del arrays
+        del table
+
     def close(self) -> None:
+        self.flush()
         if self.writer is not None:
             self.writer.close()
             self.writer = None
-
-
-def rows_to_arrow(rows: List[Dict[str, Any]], schema: pa.Schema) -> pa.Table:
-    cols = {}
-    for field in schema:
-        vals = [row.get(field.name) for row in rows]
-        cols[field.name] = pa.array(vals, type=field.type)
-    return pa.Table.from_pydict(cols, schema=schema)
 
 
 # ============================================================
@@ -148,15 +229,15 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    return df[required].copy()
+    return df[required]
 
 
-def clean_chunk(
+def clean_chunk_to_numpy(
     df: pd.DataFrame,
     allowed_rating_min: float,
     allowed_rating_max: float,
     drop_invalid_rows: bool,
-) -> Tuple[pd.DataFrame, Dict[str, int]]:
+) -> Tuple[Dict[str, np.ndarray], Dict[str, int]]:
     stats = {
         "rows_in": len(df),
         "rows_dropped_null": 0,
@@ -173,114 +254,196 @@ def clean_chunk(
     df = df.dropna(subset=["user_id", "movie_id", "rating", "timestamp"])
     stats["rows_dropped_null"] = before_null - len(df)
 
-    df["user_id"] = df["user_id"].astype("int64")
-    df["movie_id"] = df["movie_id"].astype("int64")
-    df["rating"] = df["rating"].astype("float64")
-    df["timestamp"] = df["timestamp"].astype("int64")
+    if df.empty:
+        return {
+            "user_id": np.empty(0, dtype=np.int64),
+            "movie_id": np.empty(0, dtype=np.int64),
+            "rating": np.empty(0, dtype=np.float64),
+            "timestamp": np.empty(0, dtype=np.int64),
+        }, stats
+
+    user_id = df["user_id"].to_numpy(dtype=np.int64, copy=True)
+    movie_id = df["movie_id"].to_numpy(dtype=np.int64, copy=True)
+    rating = df["rating"].to_numpy(dtype=np.float64, copy=True)
+    timestamp = df["timestamp"].to_numpy(dtype=np.int64, copy=True)
 
     if drop_invalid_rows:
-        before_invalid = len(df)
-        df = df[
-            (df["timestamp"] > 0) &
-            (df["rating"] >= allowed_rating_min) &
-            (df["rating"] <= allowed_rating_max)
-        ].copy()
-        stats["rows_dropped_invalid"] = before_invalid - len(df)
+        mask = (
+            (timestamp > 0) &
+            (rating >= allowed_rating_min) &
+            (rating <= allowed_rating_max)
+        )
+        stats["rows_dropped_invalid"] = int(len(timestamp) - int(mask.sum()))
 
-    stats["rows_out"] = len(df)
-    return df, stats
+        user_id = user_id[mask]
+        movie_id = movie_id[mask]
+        rating = rating[mask]
+        timestamp = timestamp[mask]
+
+    stats["rows_out"] = len(user_id)
+    return {
+        "user_id": user_id,
+        "movie_id": movie_id,
+        "rating": rating,
+        "timestamp": timestamp,
+    }, stats
 
 
 # ============================================================
 # Movie embedding loading
 # ============================================================
-def load_movie_embeddings(parquet_path: str) -> Tuple[Dict[int, np.ndarray], int]:
-    if not os.path.exists(parquet_path):
-        raise FileNotFoundError(f"movie embedding parquet not found: {parquet_path}")
+@dataclass
+class MovieEmbeddingStore:
+    movie_to_index: Dict[int, int]
+    embeddings: np.ndarray
+    embedding_dim: int
 
-    df = pd.read_parquet(parquet_path, columns=["movieId", "embedding"])
-    df = df.dropna(subset=["movieId", "embedding"]).copy()
+    def get(self, movie_id: int) -> Optional[np.ndarray]:
+        idx = self.movie_to_index.get(int(movie_id))
+        if idx is None:
+            return None
+        return self.embeddings[idx]
 
-    movie_embedding_map: Dict[int, np.ndarray] = {}
+
+def load_movie_embeddings(parquet_path: str, batch_size: int = 50000) -> MovieEmbeddingStore:
+    movie_ids: List[int] = []
+    embeddings_list: List[np.ndarray] = []
     embedding_dim: Optional[int] = None
 
-    for row in df.itertuples(index=False):
-        try:
-            movie_id = int(row.movieId)
-            emb = np.asarray(row.embedding, dtype=np.float32)
-        except Exception:
-            continue
+    with open_input_binary(parquet_path) as source:
+        parquet_file = pq.ParquetFile(source)
 
-        if emb.ndim != 1:
-            continue
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=["movieId", "embedding"]):
+            table = pa.Table.from_batches([batch])
+            movie_col = table.column("movieId").to_pylist()
+            emb_col = table.column("embedding").to_pylist()
 
-        if embedding_dim is None:
-            embedding_dim = int(emb.shape[0])
+            for movie_id_raw, emb_raw in zip(movie_col, emb_col):
+                if movie_id_raw is None or emb_raw is None:
+                    continue
+                try:
+                    movie_id = int(movie_id_raw)
+                    emb = np.asarray(emb_raw, dtype=np.float32)
+                except Exception:
+                    continue
 
-        if emb.shape[0] != embedding_dim:
-            continue
+                if emb.ndim != 1:
+                    continue
 
-        movie_embedding_map[movie_id] = emb
+                if embedding_dim is None:
+                    embedding_dim = int(emb.shape[0])
 
-    if embedding_dim is None or not movie_embedding_map:
+                if emb.shape[0] != embedding_dim:
+                    continue
+
+                movie_ids.append(movie_id)
+                embeddings_list.append(emb)
+
+            del table
+            del batch
+
+    if embedding_dim is None or not embeddings_list:
         raise ValueError("No valid embeddings found in movie embedding parquet")
 
-    return movie_embedding_map, embedding_dim
+    embeddings = np.vstack(embeddings_list).astype(np.float32, copy=False)
+    movie_to_index = {mid: idx for idx, mid in enumerate(movie_ids)}
+
+    del embeddings_list
+    gc.collect()
+
+    return MovieEmbeddingStore(
+        movie_to_index=movie_to_index,
+        embeddings=embeddings,
+        embedding_dim=int(embedding_dim),
+    )
 
 
 # ============================================================
 # User embedding aggregation
 # ============================================================
 def weighted_average_embedding(
-    movie_ids: List[int],
-    ratings: List[float],
-    time_weights: List[float],
-    movie_embedding_map: Dict[int, np.ndarray],
+    movie_ids: np.ndarray,
+    ratings: np.ndarray,
+    time_weights: np.ndarray,
+    movie_store: MovieEmbeddingStore,
     preference_anchor_rating: float,
-    embedding_dim: int,
     min_positive_weight_sum: float,
 ) -> Tuple[Optional[np.ndarray], int, int]:
+    embedding_dim = movie_store.embedding_dim
     vec_sum = np.zeros(embedding_dim, dtype=np.float32)
     weight_sum = 0.0
     used_count = 0
     missing_count = 0
 
-    for movie_id, rating, t_weight in zip(movie_ids, ratings, time_weights):
-        emb = movie_embedding_map.get(int(movie_id))
-        if emb is None:
+    for i in range(len(movie_ids)):
+        idx = movie_store.movie_to_index.get(int(movie_ids[i]))
+        if idx is None:
             missing_count += 1
             continue
 
-        pref_weight = max(float(rating) - preference_anchor_rating, 0.0)
-        final_weight = pref_weight * float(t_weight)
+        pref_weight = max(float(ratings[i]) - preference_anchor_rating, 0.0)
+        final_weight = pref_weight * float(time_weights[i])
 
         if final_weight <= 0:
             continue
 
-        vec_sum += final_weight * emb
+        vec_sum += final_weight * movie_store.embeddings[idx]
         weight_sum += final_weight
         used_count += 1
 
     if weight_sum <= min_positive_weight_sum:
         return None, used_count, missing_count
 
-    return (vec_sum / weight_sum).astype(np.float32), used_count, missing_count
+    return (vec_sum / weight_sum).astype(np.float32, copy=False), used_count, missing_count
 
 
 # ============================================================
 # Per-user processing
 # ============================================================
 @dataclass
-class UserBuildResult:
-    base_user_events: List[Dict[str, Any]]
-    remaining_user_events: List[Dict[str, Any]]
-    base_users: List[Dict[str, Any]]
-    base_user_profiles: List[Dict[str, Any]]
-    stats: Dict[str, int]
+class UserBuildStats:
+    users_seen: int = 1
+    users_kept: int = 0
+    users_skipped_too_few: int = 0
+    bootstrap_events: int = 0
+    remaining_events: int = 0
+    users_with_long_embedding: int = 0
+    users_with_short_embedding: int = 0
 
 
-def process_single_user(
-    user_df: pd.DataFrame,
+def deduplicate_keep_last_sorted(
+    user_id: np.ndarray,
+    movie_id: np.ndarray,
+    rating: np.ndarray,
+    timestamp: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    # 输入已经按 timestamp 排序时，反向 unique 保留最后一次
+    seen = set()
+    keep_rev_indices = []
+    for i in range(len(movie_id) - 1, -1, -1):
+        mid = int(movie_id[i])
+        if mid not in seen:
+            seen.add(mid)
+            keep_rev_indices.append(i)
+
+    keep_indices = np.array(keep_rev_indices[::-1], dtype=np.int64)
+    return (
+        user_id[keep_indices],
+        movie_id[keep_indices],
+        rating[keep_indices],
+        timestamp[keep_indices],
+    )
+
+
+def utc_datetimes_from_seconds(ts: np.ndarray) -> List[datetime]:
+    return [datetime.fromtimestamp(int(x), tz=timezone.utc) for x in ts]
+
+
+def process_single_user_arrays(
+    user_id_arr: np.ndarray,
+    movie_id_arr: np.ndarray,
+    rating_arr: np.ndarray,
+    timestamp_arr: np.ndarray,
     min_interactions_per_user: int,
     bootstrap_ratio: float,
     min_bootstrap_interactions: int,
@@ -290,160 +453,170 @@ def process_single_user(
     recent_k: int,
     half_life_days: int,
     profile_version: str,
-    movie_embedding_map: Dict[int, np.ndarray],
-    embedding_dim: int,
+    movie_store: MovieEmbeddingStore,
     preference_anchor_rating: float,
     min_positive_weight_sum: float,
-) -> UserBuildResult:
-    result = UserBuildResult([], [], [], [], {
-        "users_seen": 1,
-        "users_kept": 0,
-        "users_skipped_too_few": 0,
-        "bootstrap_events": 0,
-        "remaining_events": 0,
-        "users_with_long_embedding": 0,
-        "users_with_short_embedding": 0,
-    })
+) -> Tuple[
+    Optional[Dict[str, List[Any]]],
+    Optional[Dict[str, List[Any]]],
+    Optional[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+    Dict[str, int]
+]:
+    stats = UserBuildStats().__dict__
 
-    if user_df.empty:
-        result.stats["users_skipped_too_few"] = 1
-        return result
+    n = len(user_id_arr)
+    if n == 0:
+        stats["users_skipped_too_few"] = 1
+        return None, None, None, None, stats
 
-    user_df = user_df.sort_values("timestamp", kind="stable").copy()
+    # 原始文件若已按 user_id, timestamp 排序，这里不需要重新排序
+    # 若你不完全确定 timestamp 也有序，可放开下面这段：
+    # order = np.argsort(timestamp_arr, kind="stable")
+    # user_id_arr = user_id_arr[order]
+    # movie_id_arr = movie_id_arr[order]
+    # rating_arr = rating_arr[order]
+    # timestamp_arr = timestamp_arr[order]
 
     if deduplicate_user_movie:
-        user_df = user_df.drop_duplicates(subset=["user_id", "movie_id"], keep="last").copy()
-        user_df = user_df.sort_values("timestamp", kind="stable").copy()
+        user_id_arr, movie_id_arr, rating_arr, timestamp_arr = deduplicate_keep_last_sorted(
+            user_id_arr, movie_id_arr, rating_arr, timestamp_arr
+        )
+        n = len(user_id_arr)
 
-    n = len(user_df)
     if n < min_interactions_per_user:
-        result.stats["users_skipped_too_few"] = 1
-        return result
+        stats["users_skipped_too_few"] = 1
+        return None, None, None, None, stats
 
     bootstrap_n = max(min_bootstrap_interactions, int(math.floor(n * bootstrap_ratio)))
     max_bootstrap_allowed = n - min_remaining_interactions
     bootstrap_n = min(bootstrap_n, max_bootstrap_allowed)
 
     if bootstrap_n < min_bootstrap_interactions or (n - bootstrap_n) < min_remaining_interactions:
-        result.stats["users_skipped_too_few"] = 1
-        return result
+        stats["users_skipped_too_few"] = 1
+        return None, None, None, None, stats
 
-    boot = user_df.iloc[:bootstrap_n].copy()
-    remain = user_df.iloc[bootstrap_n:].copy()
+    boot_slice = slice(0, bootstrap_n)
+    remain_slice = slice(bootstrap_n, n)
 
-    if boot.empty or remain.empty:
-        result.stats["users_skipped_too_few"] = 1
-        return result
+    boot_user_id = user_id_arr[boot_slice]
+    boot_movie_id = movie_id_arr[boot_slice]
+    boot_rating = rating_arr[boot_slice]
+    boot_timestamp = timestamp_arr[boot_slice]
 
-    user_id = int(boot["user_id"].iloc[0])
+    remain_user_id = user_id_arr[remain_slice]
+    remain_movie_id = movie_id_arr[remain_slice]
+    remain_rating = rating_arr[remain_slice]
+    remain_timestamp = timestamp_arr[remain_slice]
 
-    boot["event_order"] = np.arange(1, len(boot) + 1, dtype=np.int32)
-    boot["event_time"] = pd.to_datetime(boot["timestamp"], unit="s", utc=True)
+    if len(boot_user_id) == 0 or len(remain_user_id) == 0:
+        stats["users_skipped_too_few"] = 1
+        return None, None, None, None, stats
 
-    boot_avg_rating = float(boot["rating"].mean())
-    boot["is_positive"] = boot["rating"] >= positive_rating_threshold
-    boot["rating_centered"] = boot["rating"] - boot_avg_rating
+    user_id = int(boot_user_id[0])
 
-    user_last_ts = int(boot["timestamp"].max())
-    diff_days = (user_last_ts - boot["timestamp"]) / 86400.0
-    decay_lambda = np.log(2) / max(half_life_days, 1)
-    boot["time_weight"] = np.exp(-decay_lambda * diff_days)
+    event_order = np.arange(1, len(boot_user_id) + 1, dtype=np.int32)
+    boot_event_time = utc_datetimes_from_seconds(boot_timestamp)
 
-    remain["future_event_order"] = np.arange(1, len(remain) + 1, dtype=np.int32)
-    remain["event_time"] = pd.to_datetime(remain["timestamp"], unit="s", utc=True)
+    boot_avg_rating = float(boot_rating.mean())
+    is_positive = boot_rating >= positive_rating_threshold
+    rating_centered = boot_rating - boot_avg_rating
 
-    # Long-term embedding
+    user_last_ts = int(boot_timestamp.max())
+    diff_days = (user_last_ts - boot_timestamp).astype(np.float64) / 86400.0
+    decay_lambda = np.log(2.0) / max(half_life_days, 1)
+    time_weight = np.exp(-decay_lambda * diff_days).astype(np.float64, copy=False)
+
+    future_event_order = np.arange(1, len(remain_user_id) + 1, dtype=np.int32)
+    remain_event_time = utc_datetimes_from_seconds(remain_timestamp)
+
     long_emb, long_used, long_missing = weighted_average_embedding(
-        movie_ids=boot["movie_id"].astype("int64").tolist(),
-        ratings=boot["rating"].astype("float64").tolist(),
-        time_weights=boot["time_weight"].astype("float64").tolist(),
-        movie_embedding_map=movie_embedding_map,
+        movie_ids=boot_movie_id,
+        ratings=boot_rating,
+        time_weights=time_weight,
+        movie_store=movie_store,
         preference_anchor_rating=preference_anchor_rating,
-        embedding_dim=embedding_dim,
         min_positive_weight_sum=min_positive_weight_sum,
     )
 
-    # Short-term embedding
-    recent_boot = boot.tail(recent_k).copy()
+    recent_start = max(0, len(boot_movie_id) - recent_k)
     short_emb, short_used, short_missing = weighted_average_embedding(
-        movie_ids=recent_boot["movie_id"].astype("int64").tolist(),
-        ratings=recent_boot["rating"].astype("float64").tolist(),
-        time_weights=recent_boot["time_weight"].astype("float64").tolist(),
-        movie_embedding_map=movie_embedding_map,
+        movie_ids=boot_movie_id[recent_start:],
+        ratings=boot_rating[recent_start:],
+        time_weights=time_weight[recent_start:],
+        movie_store=movie_store,
         preference_anchor_rating=preference_anchor_rating,
-        embedding_dim=embedding_dim,
         min_positive_weight_sum=min_positive_weight_sum,
     )
 
     built_at = datetime.now(timezone.utc)
 
-    result.base_user_events = [
-        {
-            "user_id": int(r.user_id),
-            "movie_id": int(r.movie_id),
-            "rating": float(r.rating),
-            "timestamp": int(r.timestamp),
-            "event_time": r.event_time.to_pydatetime(),
-            "event_order": int(r.event_order),
-            "is_positive": bool(r.is_positive),
-            "rating_centered": float(r.rating_centered),
-            "time_weight": float(r.time_weight),
-        }
-        for r in boot.itertuples(index=False)
-    ]
+    base_user_events_cols = {
+        "user_id": boot_user_id.tolist(),
+        "movie_id": boot_movie_id.tolist(),
+        "rating": boot_rating.astype(np.float64, copy=False).tolist(),
+        "timestamp": boot_timestamp.tolist(),
+        "event_time": boot_event_time,
+        "event_order": event_order.tolist(),
+        "is_positive": is_positive.tolist(),
+        "rating_centered": rating_centered.astype(np.float64, copy=False).tolist(),
+        "time_weight": time_weight.astype(np.float64, copy=False).tolist(),
+    }
 
-    result.remaining_user_events = [
-        {
-            "user_id": int(r.user_id),
-            "movie_id": int(r.movie_id),
-            "rating": float(r.rating),
-            "timestamp": int(r.timestamp),
-            "event_time": r.event_time.to_pydatetime(),
-            "future_event_order": int(r.future_event_order),
-        }
-        for r in remain.itertuples(index=False)
-    ]
+    remaining_user_events_cols = {
+        "user_id": remain_user_id.tolist(),
+        "movie_id": remain_movie_id.tolist(),
+        "rating": remain_rating.astype(np.float64, copy=False).tolist(),
+        "timestamp": remain_timestamp.tolist(),
+        "event_time": remain_event_time,
+        "future_event_order": future_event_order.tolist(),
+    }
 
-    std_rating = float(boot["rating"].std(ddof=1)) if len(boot) > 1 else 0.0
+    std_rating = float(np.std(boot_rating, ddof=1)) if len(boot_rating) > 1 else 0.0
 
-    result.base_users = [{
+    base_user_row = {
         "user_id": user_id,
         "num_total_interactions": int(n),
-        "num_bootstrap_interactions": int(len(boot)),
-        "num_remaining_interactions": int(len(remain)),
-        "first_timestamp": int(user_df["timestamp"].min()),
-        "last_bootstrap_timestamp": int(boot["timestamp"].max()),
-        "last_total_timestamp": int(user_df["timestamp"].max()),
+        "num_bootstrap_interactions": int(len(boot_user_id)),
+        "num_remaining_interactions": int(len(remain_user_id)),
+        "first_timestamp": int(timestamp_arr.min()),
+        "last_bootstrap_timestamp": int(boot_timestamp.max()),
+        "last_total_timestamp": int(timestamp_arr.max()),
         "avg_rating_bootstrap": float(boot_avg_rating),
         "std_rating_bootstrap": std_rating,
-        "activity_span_days": float((int(user_df["timestamp"].max()) - int(user_df["timestamp"].min())) / 86400.0),
-        "profile_confidence": float(np.log1p(len(boot))),
+        "activity_span_days": float((int(timestamp_arr.max()) - int(timestamp_arr.min())) / 86400.0),
+        "profile_confidence": float(np.log1p(len(boot_user_id))),
         "built_at": built_at,
-    }]
+    }
 
-    result.base_user_profiles = [{
+    base_user_profile_row = {
         "user_id": user_id,
         "long_term_embedding": long_emb.tolist() if long_emb is not None else None,
         "short_term_embedding": short_emb.tolist() if short_emb is not None else None,
-        "embedding_dim": int(embedding_dim),
+        "embedding_dim": int(movie_store.embedding_dim),
         "num_embedded_bootstrap_interactions": int(long_used),
         "num_missing_embedding_movies": int(long_missing),
         "rating_bias": float(boot_avg_rating),
-        "activity_level": float(len(boot)),
+        "activity_level": float(len(boot_user_id)),
         "profile_version": profile_version,
         "built_at": built_at,
-    }]
+    }
 
-    result.stats["users_kept"] = 1
-    result.stats["bootstrap_events"] = len(boot)
-    result.stats["remaining_events"] = len(remain)
-
+    stats["users_kept"] = 1
+    stats["bootstrap_events"] = len(boot_user_id)
+    stats["remaining_events"] = len(remain_user_id)
     if long_emb is not None:
-        result.stats["users_with_long_embedding"] = 1
+        stats["users_with_long_embedding"] = 1
     if short_emb is not None:
-        result.stats["users_with_short_embedding"] = 1
+        stats["users_with_short_embedding"] = 1
 
-    return result
+    return (
+        base_user_events_cols,
+        remaining_user_events_cols,
+        base_user_row,
+        base_user_profile_row,
+        stats,
+    )
 
 
 # ============================================================
@@ -468,6 +641,80 @@ def append_parquet_to_existing_iceberg_table(
 
 
 # ============================================================
+# Helpers for chunk/user boundary streaming
+# ============================================================
+def concat_pending_with_chunk(
+    pending: Optional[Dict[str, np.ndarray]],
+    current: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    if pending is None or len(pending["user_id"]) == 0:
+        return current
+    if len(current["user_id"]) == 0:
+        return pending
+
+    return {
+        "user_id": np.concatenate([pending["user_id"], current["user_id"]]),
+        "movie_id": np.concatenate([pending["movie_id"], current["movie_id"]]),
+        "rating": np.concatenate([pending["rating"], current["rating"]]),
+        "timestamp": np.concatenate([pending["timestamp"], current["timestamp"]]),
+    }
+
+
+def split_finalized_and_pending_by_last_user(
+    arrs: Dict[str, np.ndarray],
+) -> Tuple[Optional[Dict[str, np.ndarray]], Optional[Dict[str, np.ndarray]]]:
+    user_id = arrs["user_id"]
+    if len(user_id) == 0:
+        return None, None
+
+    last_user = user_id[-1]
+    cut = len(user_id)
+    while cut > 0 and user_id[cut - 1] == last_user:
+        cut -= 1
+
+    finalized = None
+    if cut > 0:
+        finalized = {
+            "user_id": arrs["user_id"][:cut],
+            "movie_id": arrs["movie_id"][:cut],
+            "rating": arrs["rating"][:cut],
+            "timestamp": arrs["timestamp"][:cut],
+        }
+
+    pending = {
+        "user_id": arrs["user_id"][cut:],
+        "movie_id": arrs["movie_id"][cut:],
+        "rating": arrs["rating"][cut:],
+        "timestamp": arrs["timestamp"][cut:],
+    }
+
+    return finalized, pending
+
+
+def iter_users_from_sorted_arrays(arrs: Dict[str, np.ndarray]):
+    user_id = arrs["user_id"]
+    if len(user_id) == 0:
+        return
+
+    # 由于数据已按 user_id 排序，用边界扫描替代 groupby
+    boundaries = np.flatnonzero(user_id[1:] != user_id[:-1]) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [len(user_id)]))
+
+    movie_id = arrs["movie_id"]
+    rating = arrs["rating"]
+    timestamp = arrs["timestamp"]
+
+    for s, e in zip(starts, ends):
+        yield (
+            user_id[s:e],
+            movie_id[s:e],
+            rating[s:e],
+            timestamp[s:e],
+        )
+
+
+# ============================================================
 # Main
 # ============================================================
 def main() -> None:
@@ -482,7 +729,7 @@ def main() -> None:
 
     ratings_path = deep_get(cfg, ["input", "ratings_path"])
     movie_embedding_path = deep_get(cfg, ["input", "movie_embedding_path"])
-    chunksize = int(deep_get(cfg, ["input", "chunksize"], 200000))
+    chunksize = int(deep_get(cfg, ["input", "chunksize"], 100000))
 
     allowed_rating_min = float(deep_get(cfg, ["cleaning", "allowed_rating_min"], 0.5))
     allowed_rating_max = float(deep_get(cfg, ["cleaning", "allowed_rating_max"], 5.0))
@@ -501,8 +748,9 @@ def main() -> None:
     preference_anchor_rating = float(deep_get(cfg, ["profile", "preference_anchor_rating"], 3.5))
     min_positive_weight_sum = float(deep_get(cfg, ["profile", "min_positive_weight_sum"], 1e-8))
 
-    base_dir = deep_get(cfg, ["output", "base_dir"], "/data/artifacts/bootstraper_v0_embedding")
+    base_dir = deep_get(cfg, ["output", "base_dir"], "s3://artifacts/bootstraper_v0_embedding")
     write_parquet = bool(deep_get(cfg, ["output", "write_parquet"], True))
+    writer_flush_rows = int(deep_get(cfg, ["output", "writer_flush_rows"], 100000))
 
     iceberg_enabled = bool(deep_get(cfg, ["iceberg", "enabled"], False))
     catalog_name = deep_get(cfg, ["iceberg", "catalog_name"], "default")
@@ -518,23 +766,36 @@ def main() -> None:
     if not movie_embedding_path:
         raise ValueError("input.movie_embedding_path is required")
 
-    os.makedirs(base_dir, exist_ok=True)
+    local_output_dir = tempfile.mkdtemp(prefix="bootstrap_outputs_")
 
-    base_user_events_path = os.path.join(base_dir, "base_user_events.parquet")
-    base_users_path = os.path.join(base_dir, "base_users.parquet")
-    base_user_profiles_path = os.path.join(base_dir, "base_user_profiles.parquet")
-    remaining_user_events_path = os.path.join(base_dir, "remaining_user_events.parquet")
+    base_user_events_target = os.path.join(base_dir, "base_user_events.parquet")
+    base_users_target = os.path.join(base_dir, "base_users.parquet")
+    base_user_profiles_target = os.path.join(base_dir, "base_user_profiles.parquet")
+    remaining_user_events_target = os.path.join(base_dir, "remaining_user_events.parquet")
+
+    base_user_events_path = os.path.join(local_output_dir, "base_user_events.parquet")
+    base_users_path = os.path.join(local_output_dir, "base_users.parquet")
+    base_user_profiles_path = os.path.join(local_output_dir, "base_user_profiles.parquet")
+    remaining_user_events_path = os.path.join(local_output_dir, "remaining_user_events.parquet")
 
     print(f"[{job_name}] loading movie embeddings from {movie_embedding_path}")
-    movie_embedding_map, embedding_dim = load_movie_embeddings(movie_embedding_path)
-    print(f"[{job_name}] loaded movie embeddings: {len(movie_embedding_map)}, dim={embedding_dim}")
+    movie_store = load_movie_embeddings(movie_embedding_path)
+    print(f"[{job_name}] loaded movie embeddings: {len(movie_store.movie_to_index)}, dim={movie_store.embedding_dim}")
 
     writers = {}
     if write_parquet:
-        writers["base_user_events"] = IncrementalParquetWriter(base_user_events_path, BASE_USER_EVENTS_SCHEMA)
-        writers["base_users"] = IncrementalParquetWriter(base_users_path, BASE_USERS_SCHEMA)
-        writers["base_user_profiles"] = IncrementalParquetWriter(base_user_profiles_path, BASE_USER_PROFILES_SCHEMA)
-        writers["remaining_user_events"] = IncrementalParquetWriter(remaining_user_events_path, REMAINING_USER_EVENTS_SCHEMA)
+        writers["base_user_events"] = ColumnBufferParquetWriter(
+            base_user_events_path, BASE_USER_EVENTS_SCHEMA, flush_rows=writer_flush_rows
+        )
+        writers["base_users"] = ColumnBufferParquetWriter(
+            base_users_path, BASE_USERS_SCHEMA, flush_rows=max(10000, writer_flush_rows // 10)
+        )
+        writers["base_user_profiles"] = ColumnBufferParquetWriter(
+            base_user_profiles_path, BASE_USER_PROFILES_SCHEMA, flush_rows=max(10000, writer_flush_rows // 10)
+        )
+        writers["remaining_user_events"] = ColumnBufferParquetWriter(
+            remaining_user_events_path, REMAINING_USER_EVENTS_SCHEMA, flush_rows=writer_flush_rows
+        )
 
     global_stats = {
         "chunks_seen": 0,
@@ -551,16 +812,18 @@ def main() -> None:
         "remaining_events": 0,
     }
 
-    pending_user_df: Optional[pd.DataFrame] = None
+    pending_user_arrays: Optional[Dict[str, np.ndarray]] = None
+
+    rows, chunks = estimate_chunks("/data/raw/non_s3/ratings.csv", chunksize)
+    print(f"[PRECHECK] rows={rows}, estimated_chunks={chunks}")
+    return
 
     print(f"[{job_name}] start reading ratings: {ratings_path}")
-    chunk_iter = pd.read_csv(ratings_path, chunksize=chunksize)
-
-    for chunk_idx, raw_chunk in enumerate(chunk_iter, start=1):
+    for chunk_idx, raw_chunk in enumerate(csv_chunks_from_input(ratings_path, chunksize), start=1):
         global_stats["chunks_seen"] += 1
         global_stats["rows_in_raw"] += len(raw_chunk)
 
-        clean_df, clean_stats = clean_chunk(
+        clean_arrs, clean_stats = clean_chunk_to_numpy(
             raw_chunk,
             allowed_rating_min=allowed_rating_min,
             allowed_rating_max=allowed_rating_max,
@@ -571,22 +834,31 @@ def main() -> None:
         global_stats["rows_dropped_null"] += clean_stats["rows_dropped_null"]
         global_stats["rows_dropped_invalid"] += clean_stats["rows_dropped_invalid"]
 
-        if pending_user_df is not None and not pending_user_df.empty:
-            clean_df = pd.concat([pending_user_df, clean_df], ignore_index=True)
-            pending_user_df = None
+        del raw_chunk
 
-        if clean_df.empty:
+        merged_arrs = concat_pending_with_chunk(pending_user_arrays, clean_arrs)
+        pending_user_arrays = None
+        del clean_arrs
+
+        if len(merged_arrs["user_id"]) == 0:
             continue
 
-        # 原始文件按 user_id 排序，因此只需要把最后一个用户留到下一块
-        last_user_id = int(clean_df["user_id"].iloc[-1])
-        finalized_df = clean_df[clean_df["user_id"] != last_user_id].copy()
-        pending_user_df = clean_df[clean_df["user_id"] == last_user_id].copy()
+        finalized_arrs, pending_user_arrays = split_finalized_and_pending_by_last_user(merged_arrs)
+        del merged_arrs
 
-        if not finalized_df.empty:
-            for _, user_df in finalized_df.groupby("user_id", sort=False):
-                build_result = process_single_user(
-                    user_df=user_df,
+        if finalized_arrs is not None:
+            for user_id_arr, movie_id_arr, rating_arr, timestamp_arr in iter_users_from_sorted_arrays(finalized_arrs):
+                (
+                    base_user_events_cols,
+                    remaining_user_events_cols,
+                    base_user_row,
+                    base_user_profile_row,
+                    stats,
+                ) = process_single_user_arrays(
+                    user_id_arr=user_id_arr,
+                    movie_id_arr=movie_id_arr,
+                    rating_arr=rating_arr,
+                    timestamp_arr=timestamp_arr,
                     min_interactions_per_user=min_interactions_per_user,
                     bootstrap_ratio=bootstrap_ratio,
                     min_bootstrap_interactions=min_bootstrap_interactions,
@@ -596,20 +868,23 @@ def main() -> None:
                     recent_k=recent_k,
                     half_life_days=half_life_days,
                     profile_version=profile_version,
-                    movie_embedding_map=movie_embedding_map,
-                    embedding_dim=embedding_dim,
+                    movie_store=movie_store,
                     preference_anchor_rating=preference_anchor_rating,
                     min_positive_weight_sum=min_positive_weight_sum,
                 )
 
-                for k, v in build_result.stats.items():
+                for k, v in stats.items():
                     global_stats[k] += v
 
                 if write_parquet:
-                    writers["base_user_events"].write_rows(build_result.base_user_events)
-                    writers["remaining_user_events"].write_rows(build_result.remaining_user_events)
-                    writers["base_users"].write_rows(build_result.base_users)
-                    writers["base_user_profiles"].write_rows(build_result.base_user_profiles)
+                    if base_user_events_cols is not None:
+                        writers["base_user_events"].append_columns(base_user_events_cols)
+                    if remaining_user_events_cols is not None:
+                        writers["remaining_user_events"].append_columns(remaining_user_events_cols)
+                    if base_user_row is not None:
+                        writers["base_users"].append_one(base_user_row)
+                    if base_user_profile_row is not None:
+                        writers["base_user_profiles"].append_one(base_user_profile_row)
 
                 if global_stats["users_seen"] > 0 and global_stats["users_seen"] % log_every_users == 0:
                     print(
@@ -620,16 +895,29 @@ def main() -> None:
                         f"remaining_events={global_stats['remaining_events']}"
                     )
 
+            del finalized_arrs
+
         if chunk_idx % 10 == 0:
             print(
                 f"[{job_name}] chunk={chunk_idx}, "
                 f"rows_in_raw={global_stats['rows_in_raw']}, "
                 f"rows_after_cleaning={global_stats['rows_after_cleaning']}"
             )
+            gc.collect()
+            print(f"[{job_name}] Chunk {chunk_idx} done, memory garbage collected.")
 
-    if pending_user_df is not None and not pending_user_df.empty:
-        build_result = process_single_user(
-            user_df=pending_user_df,
+    if pending_user_arrays is not None and len(pending_user_arrays["user_id"]) > 0:
+        (
+            base_user_events_cols,
+            remaining_user_events_cols,
+            base_user_row,
+            base_user_profile_row,
+            stats,
+        ) = process_single_user_arrays(
+            user_id_arr=pending_user_arrays["user_id"],
+            movie_id_arr=pending_user_arrays["movie_id"],
+            rating_arr=pending_user_arrays["rating"],
+            timestamp_arr=pending_user_arrays["timestamp"],
             min_interactions_per_user=min_interactions_per_user,
             bootstrap_ratio=bootstrap_ratio,
             min_bootstrap_interactions=min_bootstrap_interactions,
@@ -639,23 +927,36 @@ def main() -> None:
             recent_k=recent_k,
             half_life_days=half_life_days,
             profile_version=profile_version,
-            movie_embedding_map=movie_embedding_map,
-            embedding_dim=embedding_dim,
+            movie_store=movie_store,
             preference_anchor_rating=preference_anchor_rating,
             min_positive_weight_sum=min_positive_weight_sum,
         )
 
-        for k, v in build_result.stats.items():
+        for k, v in stats.items():
             global_stats[k] += v
 
         if write_parquet:
-            writers["base_user_events"].write_rows(build_result.base_user_events)
-            writers["remaining_user_events"].write_rows(build_result.remaining_user_events)
-            writers["base_users"].write_rows(build_result.base_users)
-            writers["base_user_profiles"].write_rows(build_result.base_user_profiles)
+            if base_user_events_cols is not None:
+                writers["base_user_events"].append_columns(base_user_events_cols)
+            if remaining_user_events_cols is not None:
+                writers["remaining_user_events"].append_columns(remaining_user_events_cols)
+            if base_user_row is not None:
+                writers["base_users"].append_one(base_user_row)
+            if base_user_profile_row is not None:
+                writers["base_user_profiles"].append_one(base_user_profile_row)
 
     for writer in writers.values():
         writer.close()
+
+    if write_parquet:
+        uploaded_paths = {
+            "base_user_events": upload_file_to_path(base_user_events_path, base_user_events_target),
+            "base_users": upload_file_to_path(base_users_path, base_users_target),
+            "base_user_profiles": upload_file_to_path(base_user_profiles_path, base_user_profiles_target),
+            "remaining_user_events": upload_file_to_path(remaining_user_events_path, remaining_user_events_target),
+        }
+    else:
+        uploaded_paths = {}
 
     if iceberg_enabled:
         if not write_parquet:
@@ -696,8 +997,8 @@ def main() -> None:
             "ratings_path": ratings_path,
             "movie_embedding_path": movie_embedding_path,
             "chunksize": chunksize,
-            "embedding_dim": embedding_dim,
-            "num_movie_embeddings": len(movie_embedding_map),
+            "embedding_dim": movie_store.embedding_dim,
+            "num_movie_embeddings": len(movie_store.movie_to_index),
         },
         "cleaning": {
             "allowed_rating_min": allowed_rating_min,
@@ -721,12 +1022,12 @@ def main() -> None:
             "min_positive_weight_sum": min_positive_weight_sum,
         },
         "output": {
-            "base_dir": base_dir,
+            "base_dir": to_s3_uri(base_dir),
             "parquet_files": {
-                "base_user_events": base_user_events_path,
-                "base_users": base_users_path,
-                "base_user_profiles": base_user_profiles_path,
-                "remaining_user_events": remaining_user_events_path,
+                "base_user_events": uploaded_paths.get("base_user_events", to_s3_uri(base_user_events_target)),
+                "base_users": uploaded_paths.get("base_users", to_s3_uri(base_users_target)),
+                "base_user_profiles": uploaded_paths.get("base_user_profiles", to_s3_uri(base_user_profiles_target)),
+                "remaining_user_events": uploaded_paths.get("remaining_user_events", to_s3_uri(remaining_user_events_target)),
             },
         },
         "iceberg": {
@@ -738,11 +1039,11 @@ def main() -> None:
         "stats": global_stats,
     }
 
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    manifest_payload = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
+    manifest_uri = upload_bytes_to_path(manifest_payload, manifest_path)
 
     print(f"[{job_name}] done")
+    print(f"[{job_name}] manifest uploaded: {manifest_uri}")
     print(json.dumps(global_stats, indent=2, ensure_ascii=False))
 
 

@@ -11,23 +11,29 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from minio_s3 import (
+    path_exists,
+    read_csv_auto,
+    write_dataframe_jsonl_to_path,
+    write_dataframe_parquet_to_path,
+)
+
 
 # =========================
 # Config
 # =========================
-OBJECT_ROOT = Path("/mnt/object")
-BUCKET_NAME = "bucket"
+OBJECT_ROOT = Path("/data/")
 
-RAW_DIR = OBJECT_ROOT / BUCKET_NAME / "raw"
-CLEANED_DIR = OBJECT_ROOT / BUCKET_NAME / "cleaned"
+RAW_BUCKET = "s3://raw"
+CLEANED_BUCKET = "s3://cleaned"
 
-MOVIES_FILE = RAW_DIR / "movies.csv"
-LINKS_FILE = RAW_DIR / "links.csv"
-TAGS_FILE = RAW_DIR / "tags.csv"
-TMDB_FILE = RAW_DIR / "TMDB_movie_dataset_v11.csv"
+MOVIES_FILE = f"{RAW_BUCKET}/movies.csv"
+LINKS_FILE = f"{RAW_BUCKET}/links.csv"
+TAGS_FILE = f"{RAW_BUCKET}/tags.csv"
+TMDB_FILE = f"{RAW_BUCKET}/TMDB_movie_dataset_v11.csv"
 
-OUTPUT_PARQUET = CLEANED_DIR / "movie_embedding_text.parquet"
-OUTPUT_JSONL = CLEANED_DIR / "movie_embedding_text.jsonl"
+OUTPUT_PARQUET = f"{CLEANED_BUCKET}/movie_embedding_text.parquet"
+OUTPUT_JSONL = f"{CLEANED_BUCKET}/movie_embedding_text.jsonl"
 
 TAGS_CHUNKSIZE = 250_000
 TMDB_CHUNKSIZE = 100_000
@@ -55,6 +61,7 @@ def normalize_whitespace(text: Any) -> str:
     return text
 
 
+
 def clean_text(text: Any) -> str:
     text = normalize_whitespace(text)
     if not text:
@@ -63,6 +70,7 @@ def clean_text(text: Any) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
 
 
 def dedupe_keep_order(items: Iterable[str]) -> list[str]:
@@ -80,6 +88,30 @@ def dedupe_keep_order(items: Iterable[str]) -> list[str]:
     return result
 
 
+
+def ensure_str_list(value: Any) -> list[str]:
+    """
+    Convert a value into a clean list[str].
+    Handles None, NaN, scalar strings, lists, tuples, and set-like values.
+    """
+    if value is None:
+        return []
+    if isinstance(value, float) and math.isnan(value):
+        return []
+
+    if isinstance(value, str):
+        text = clean_text(value)
+        return [text] if text else []
+
+    if isinstance(value, (list, tuple, set)):
+        result = [clean_text(x) for x in value]
+        return [x for x in result if x]
+
+    text = clean_text(value)
+    return [text] if text else []
+
+
+
 def parse_movielens_genres(value: Any) -> list[str]:
     text = clean_text(value)
     if not text or text == "(no genres listed)":
@@ -87,11 +119,13 @@ def parse_movielens_genres(value: Any) -> list[str]:
     return dedupe_keep_order(text.split("|"))
 
 
+
 def safe_literal_eval(value: str) -> Any:
     try:
         return ast.literal_eval(value)
     except Exception:
         return None
+
 
 
 def parse_jsonish_list(value: Any) -> list[str]:
@@ -148,6 +182,7 @@ def parse_jsonish_list(value: Any) -> list[str]:
     return [text] if text else []
 
 
+
 def to_yes_no(value: Any) -> str:
     if value is None:
         return ""
@@ -166,6 +201,7 @@ def to_yes_no(value: Any) -> str:
     return ""
 
 
+
 def extract_release_year(release_date: Any, title: Any) -> str:
     rd = clean_text(release_date)
     if rd:
@@ -181,13 +217,14 @@ def extract_release_year(release_date: Any, title: Any) -> str:
     return ""
 
 
+
 def has_enough_content(row: pd.Series) -> bool:
     title = clean_text(row.get("title"))
-    genres = row.get("genres_list", [])
+    genres = ensure_str_list(row.get("genres_list"))
     overview = clean_text(row.get("overview"))
     tagline = clean_text(row.get("tagline"))
-    keywords = row.get("keywords_list", [])
-    top_tags = row.get("top_user_tags", [])
+    keywords = ensure_str_list(row.get("keywords_list"))
+    top_tags = ensure_str_list(row.get("top_user_tags"))
 
     if not title:
         return False
@@ -207,6 +244,7 @@ def has_enough_content(row: pd.Series) -> bool:
     return semantic_signals >= 1
 
 
+
 def build_embedding_text(row: pd.Series) -> str:
     lines: list[str] = []
 
@@ -218,7 +256,7 @@ def build_embedding_text(row: pd.Series) -> str:
     if original_title and original_title.lower() != title.lower():
         lines.append(f"Original title: {original_title}")
 
-    genres = row.get("genres_list", [])
+    genres = ensure_str_list(row.get("genres_list"))
     if genres:
         lines.append(f"Genres: {', '.join(genres)}")
 
@@ -230,11 +268,11 @@ def build_embedding_text(row: pd.Series) -> str:
     if overview:
         lines.append(f"Overview: {overview[:MAX_OVERVIEW_CHARS].strip()}")
 
-    keywords = row.get("keywords_list", [])
+    keywords = ensure_str_list(row.get("keywords_list"))
     if keywords:
         lines.append(f"Keywords: {', '.join(keywords)}")
 
-    top_user_tags = row.get("top_user_tags", [])
+    top_user_tags = ensure_str_list(row.get("top_user_tags"))
     if top_user_tags:
         lines.append(f"User tags: {', '.join(top_user_tags)}")
 
@@ -242,15 +280,15 @@ def build_embedding_text(row: pd.Series) -> str:
     if original_language:
         lines.append(f"Original language: {original_language}")
 
-    spoken_languages = row.get("spoken_languages_list", [])
+    spoken_languages = ensure_str_list(row.get("spoken_languages_list"))
     if spoken_languages:
         lines.append(f"Spoken languages: {', '.join(spoken_languages)}")
 
-    production_countries = row.get("production_countries_list", [])
+    production_countries = ensure_str_list(row.get("production_countries_list"))
     if production_countries:
         lines.append(f"Production countries: {', '.join(production_countries)}")
 
-    production_companies = row.get("production_companies_list", [])
+    production_companies = ensure_str_list(row.get("production_companies_list"))
     if production_companies:
         lines.append(f"Production companies: {', '.join(production_companies)}")
 
@@ -270,14 +308,15 @@ def build_embedding_text(row: pd.Series) -> str:
 # =========================
 def ensure_required_files() -> None:
     required = [MOVIES_FILE, LINKS_FILE, TAGS_FILE, TMDB_FILE]
-    missing = [str(path) for path in required if not path.exists()]
+    missing = [str(path) for path in required if not path_exists(path)]
     if missing:
         raise FileNotFoundError("Missing required files:\n" + "\n".join(missing))
 
 
+
 def load_movies() -> pd.DataFrame:
     logger.info("Loading movies.csv ...")
-    df = pd.read_csv(
+    df = read_csv_auto(
         MOVIES_FILE,
         usecols=["movieId", "title", "genres"],
         dtype={
@@ -291,9 +330,10 @@ def load_movies() -> pd.DataFrame:
     return df[["movieId", "title", "genres_list"]]
 
 
+
 def load_links() -> pd.DataFrame:
     logger.info("Loading links.csv ...")
-    df = pd.read_csv(
+    df = read_csv_auto(
         LINKS_FILE,
         usecols=["movieId", "imdbId", "tmdbId"],
         dtype={
@@ -305,12 +345,13 @@ def load_links() -> pd.DataFrame:
     return df
 
 
+
 def aggregate_tags_chunked() -> pd.DataFrame:
     logger.info("Aggregating tags.csv in chunks ...")
     tag_counter_by_movie: dict[int, Counter[str]] = defaultdict(Counter)
 
     for i, chunk in enumerate(
-        pd.read_csv(
+        read_csv_auto(
             TAGS_FILE,
             usecols=["movieId", "tag"],
             dtype={
@@ -348,6 +389,7 @@ def aggregate_tags_chunked() -> pd.DataFrame:
     return result
 
 
+
 def load_tmdb_filtered(needed_tmdb_ids: set[int]) -> pd.DataFrame:
     logger.info("Loading TMDB file in chunks and filtering by tmdbId ...")
 
@@ -370,7 +412,7 @@ def load_tmdb_filtered(needed_tmdb_ids: set[int]) -> pd.DataFrame:
     collected_chunks: list[pd.DataFrame] = []
 
     for i, chunk in enumerate(
-        pd.read_csv(
+        read_csv_auto(
             TMDB_FILE,
             usecols=lambda c: c in tmdb_usecols,
             dtype={
@@ -457,7 +499,6 @@ def load_tmdb_filtered(needed_tmdb_ids: set[int]) -> pd.DataFrame:
 # =========================
 def main() -> None:
     ensure_required_files()
-    CLEANED_DIR.mkdir(parents=True, exist_ok=True)
 
     movies_df = load_movies()
     links_df = load_links()
@@ -494,6 +535,18 @@ def main() -> None:
 
     logger.info("Normalizing joined fields ...")
 
+    list_columns = [
+        "genres_list",
+        "keywords_list",
+        "top_user_tags",
+        "spoken_languages_list",
+        "production_countries_list",
+        "production_companies_list",
+    ]
+    for col in list_columns:
+        if col in merged.columns:
+            merged[col] = merged[col].apply(ensure_str_list)
+
     merged["top_user_tags"] = merged["top_user_tags"].apply(
         lambda x: x if isinstance(x, list) else []
     )
@@ -501,7 +554,7 @@ def main() -> None:
     merged["genres_list"] = merged.apply(
         lambda row: row["tmdb_genres_list"]
         if isinstance(row.get("tmdb_genres_list"), list) and len(row["tmdb_genres_list"]) > 0
-        else row["genres_list"],
+        else ensure_str_list(row.get("genres_list")),
         axis=1,
     )
 
@@ -548,13 +601,18 @@ def main() -> None:
     output_cols = [c for c in output_cols if c in merged.columns]
     result = merged[output_cols].copy()
 
-    logger.info("Writing Parquet to %s ...", OUTPUT_PARQUET)
-    result.to_parquet(OUTPUT_PARQUET, index=False)
+    logger.info("Writing Parquet to MinIO target mapped from %s ...", OUTPUT_PARQUET)
+    parquet_uri = write_dataframe_parquet_to_path(result, OUTPUT_PARQUET, index=False)
 
-    logger.info("Writing JSONL to %s ...", OUTPUT_JSONL)
-    result.to_json(OUTPUT_JSONL, orient="records", lines=True, force_ascii=False)
+    logger.info("Writing JSONL to MinIO target mapped from %s ...", OUTPUT_JSONL)
+    jsonl_uri = write_dataframe_jsonl_to_path(result, OUTPUT_JSONL)
 
-    logger.info("Done. Generated %d cleaned movie rows.", len(result))
+    logger.info(
+        "Done. Generated %d cleaned movie rows. Uploaded to %s and %s",
+        len(result),
+        parquet_uri,
+        jsonl_uri,
+    )
 
 
 if __name__ == "__main__":

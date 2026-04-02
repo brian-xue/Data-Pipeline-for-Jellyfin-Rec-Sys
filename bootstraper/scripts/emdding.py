@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,16 +13,23 @@ import pyarrow.parquet as pq
 import torch
 from sentence_transformers import SentenceTransformer
 
+from minio_s3 import (
+    path_exists,
+    resolve_input_path,
+    s3_filesystem,
+    to_s3_uri,
+    upload_file_to_path,
+)
+
 
 # ============================================================
 # Paths
 # ============================================================
-OBJECT_ROOT = Path("/mnt/object")
-BUCKET_NAME = "bucket"
 
-INPUT_PARQUET = OBJECT_ROOT / BUCKET_NAME / "cleaned" / "movie_embedding_text.parquet"
-OUTPUT_DIR = OBJECT_ROOT / BUCKET_NAME / "embedding"
-OUTPUT_PARQUET = OUTPUT_DIR / "movie_embeddings.parquet"
+
+INPUT_PARQUET = "s3://cleaned/movie_embedding_text.parquet"
+OUTPUT_DIR = "s3://embedding"
+OUTPUT_PARQUET = f"{OUTPUT_DIR}/movie_embeddings.parquet"
 
 BATCH_SIZE = 256
 
@@ -243,10 +252,9 @@ def build_weighted_embeddings(
 # Main
 # ============================================================
 def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not INPUT_PARQUET.exists():
-        raise FileNotFoundError(f"Input file not found: {INPUT_PARQUET}")
+    resolved_input = resolve_input_path(INPUT_PARQUET)
+    if not path_exists(INPUT_PARQUET):
+        raise FileNotFoundError(f"Input file not found: {resolved_input}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading model on device: {device}")
@@ -259,7 +267,15 @@ def main() -> None:
     embedding_dim = model.get_sentence_embedding_dimension()
     print(f"Model embedding dimension: {embedding_dim}")
 
-    parquet_file = pq.ParquetFile(INPUT_PARQUET)
+    if resolved_input.startswith("s3://"):
+        fs = s3_filesystem()
+        parquet_file = pq.ParquetFile(fs.open(resolved_input.replace("s3://", ""), "rb"))
+    else:
+        parquet_file = pq.ParquetFile(resolved_input)
+
+    temp_output = tempfile.NamedTemporaryFile(prefix="movie_embeddings_", suffix=".parquet", delete=False)
+    temp_output_path = temp_output.name
+    temp_output.close()
 
     writer = None
     total_rows = 0
@@ -282,7 +298,7 @@ def main() -> None:
         table = pa.Table.from_pandas(output_df, preserve_index=False)
 
         if writer is None:
-            writer = pq.ParquetWriter(OUTPUT_PARQUET, table.schema)
+            writer = pq.ParquetWriter(temp_output_path, table.schema)
 
         writer.write_table(table)
         total_rows += len(output_df)
@@ -292,7 +308,11 @@ def main() -> None:
     if writer is not None:
         writer.close()
 
-    print(f"Done. Wrote embeddings to: {OUTPUT_PARQUET}")
+    output_uri = upload_file_to_path(temp_output_path, OUTPUT_PARQUET)
+    os.remove(temp_output_path)
+
+    print(f"Done. Wrote embeddings to: {output_uri}")
+    print(f"Output target mapping: {to_s3_uri(OUTPUT_PARQUET)}")
     print(f"Total rows: {total_rows}")
 
 

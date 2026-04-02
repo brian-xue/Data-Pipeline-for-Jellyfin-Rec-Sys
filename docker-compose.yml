@@ -49,6 +49,9 @@ services:
       mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
       mc mb --ignore-existing myminio/warehouse;
       mc mb --ignore-existing myminio/raw;
+      mc mb --ignore-existing myminio/cleaned;
+      mc mb --ignore-existing myminio/artifacts;
+      mc mb --ignore-existing myminio/embedding;
       exit 0;
       "
 
@@ -63,10 +66,11 @@ services:
       minio-init:
         condition: service_completed_successfully
     volumes:
-      - /mnt/object/artifacts:/data/artifacts
-      - /mnt/object/raw:/data/raw
+      - /mnt/object/minio_data/artifacts:/data/artifacts
+      - /mnt/object/minio_data/raw:/data/raw
+      - /mnt/object/minio_data:/data
       - ./bootstraper:/app
-      - /mnt/object/bucket/embedding:/data/embedding
+      - /mnt/object/minio_data/embedding:/data/embedding
     working_dir: /app
     command: tail -f /dev/null # Keep alive for manual execution/debug
     environment:
@@ -88,16 +92,14 @@ services:
       minio:
         condition: service_healthy
     volumes:
-      - /mnt/block/artifacts:/data/artifacts
+      - /mnt/object/minio_data/artifacts:/data/artifacts
       - /mnt/block/cache:/data/cache
+      - /mnt/object/minio_data/warehouse:/data/warehouse
+      - /mnt/object/minio_data:/data
       - ./pipeline:/app
     working_dir: /app
     # Execute ingestion script then exit
-    command: >
-      /bin/sh -c "
-      echo 'Starting Incremental Pipeline...';
-      python scripts/ingest_datasets.py
-      "
+    command: tail -f /dev/null # Keep alive for manual execution/debug
     environment:
       POSTGRES_HOST: postgres
       MINIO_ENDPOINT: http://minio:9000

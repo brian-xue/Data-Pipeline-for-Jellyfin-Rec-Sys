@@ -1,0 +1,1 @@
+`python /app/scripts/bootstrap_users.py --config /app/scripts/sconfig.yaml`

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import argparse
 import os
-import shutil
 import socket
 import subprocess
 import tempfile
 import zipfile
+import shutil
 from pathlib import Path
 
 import requests
+
+from minio_s3 import list_csv_files, path_exists, to_s3_uri, upload_file_to_path
 
 
 MOVIELENS_URL = "https://files.grouplens.org/datasets/movielens/ml-32m.zip"
@@ -20,6 +23,7 @@ MOVIELENS_CHECKSUMS = {
     "tags.csv": "963bf4fa4de6b8901868fddd3eb54567",
 }
 TMDB_DATASET = "asaniczka/tmdb-movies-dataset-2023-930k-movies"
+NON_S3_RAW_DIR = Path("/data/raw/non_s3")
 
 
 def md5_for_file(path: Path) -> str:
@@ -45,20 +49,27 @@ def download_file(url: str, destination: Path) -> None:
 
 
 def copy_csvs(csv_paths: list[Path], destination_dir: Path) -> None:
-    ensure_dir(destination_dir)
     for csv_path in csv_paths:
         target = destination_dir / csv_path.name
-        shutil.copy2(csv_path, target)
-        print(f"Copied {csv_path.name} -> {target}")
+        uploaded_uri = upload_file_to_path(csv_path, target)
+        print(f"Uploaded {csv_path.name} -> {uploaded_uri}")
+
+
+def save_local_only_csv(csv_path: Path, destination_dir: Path) -> Path:
+    ensure_dir(destination_dir)
+    target = destination_dir / csv_path.name
+    shutil.copy2(csv_path, target)
+    print(f"Saved local-only CSV -> {target}")
+    return target
 
 
 def ingest_movielens(raw_dir: Path, work_dir: Path) -> None:
-    movielens_dir = ensure_dir(raw_dir / "movielens32m")
+    movielens_dir = raw_dir
     expected_files = [movielens_dir / name for name in MOVIELENS_CHECKSUMS]
 
-    if all(path.exists() for path in expected_files):
-        print(f"MovieLens already present in {movielens_dir}")
-        return
+    if all(path_exists(path) for path in expected_files):
+        print(f"MovieLens already present in {to_s3_uri(movielens_dir)}")
+        # return
 
     zip_path = work_dir / "ml-32m.zip"
     extract_dir = ensure_dir(work_dir / "ml-32m")
@@ -84,17 +95,18 @@ def ingest_movielens(raw_dir: Path, work_dir: Path) -> None:
             )
 
         print(f"Checksum verified for {filename}")
+        save_local_only_csv(csv_path, NON_S3_RAW_DIR)
         csv_paths.append(csv_path)
 
     copy_csvs(csv_paths, movielens_dir)
 
 
-def ingest_tmdb(raw_dir: Path, work_dir: Path) -> None:
-    tmdb_dir = ensure_dir(raw_dir / "tmdb_movies_2024")
-    existing_csvs = sorted(tmdb_dir.glob("*.csv"))
+def ingest_tmdb(raw_dir: Path, work_dir: Path, local_only_csv: bool = False) -> None:
+    tmdb_dir = raw_dir
+    existing_csvs = list_csv_files(tmdb_dir)
     if existing_csvs:
-        print(f"TMDB dataset already present in {tmdb_dir}")
-        return
+        print(f"TMDB dataset already present in {to_s3_uri(tmdb_dir)}")
+        # return
 
     download_dir = ensure_dir(work_dir / "tmdb")
     command = [
@@ -115,13 +127,27 @@ def ingest_tmdb(raw_dir: Path, work_dir: Path) -> None:
     if not csv_paths:
         raise FileNotFoundError(f"No CSV files found after Kaggle download in {download_dir}")
 
+    save_local_only_csv(csv_paths[0], NON_S3_RAW_DIR)
+
+    if local_only_csv:
+        print("Local-only mode enabled; skipping S3 upload for TMDB CSVs.")
+        return
+
     copy_csvs(csv_paths, tmdb_dir)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingest datasets into MinIO-backed storage.")
+    parser.add_argument(
+        "--tmdb-local-only-csv",
+        action="store_true",
+        help="Only save one TMDB CSV under /mnt/object/minio_data/raw/non_s3/ and skip S3 upload for TMDB CSVs.",
+    )
+    args = parser.parse_args()
+
     warehouse_dir = ensure_dir(Path("/data/warehouse"))
     artifacts_dir = ensure_dir(Path("/data/artifacts"))
-    object_store_mount = ensure_dir(Path(os.getenv("OBJECT_STORE_MOUNT", "/mnt/object")))
+    object_store_mount = ensure_dir(Path("/data/"))
     raw_dir = ensure_dir(object_store_mount / "raw")
 
     print("Pipeline started.")
@@ -136,7 +162,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="ingest_", dir=artifacts_dir) as temp_dir:
         work_dir = Path(temp_dir)
         ingest_movielens(raw_dir, work_dir)
-        ingest_tmdb(raw_dir, work_dir)
+        ingest_tmdb(raw_dir, work_dir, local_only_csv=args.tmdb_local_only_csv)
 
     print("Dataset ingestion completed.")
 
