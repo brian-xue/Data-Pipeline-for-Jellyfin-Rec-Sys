@@ -472,11 +472,11 @@ def process_single_user_arrays(
 
     # 原始文件若已按 user_id, timestamp 排序，这里不需要重新排序
     # 若你不完全确定 timestamp 也有序，可放开下面这段：
-    # order = np.argsort(timestamp_arr, kind="stable")
-    # user_id_arr = user_id_arr[order]
-    # movie_id_arr = movie_id_arr[order]
-    # rating_arr = rating_arr[order]
-    # timestamp_arr = timestamp_arr[order]
+    order = np.argsort(timestamp_arr, kind="stable")
+    user_id_arr = user_id_arr[order]
+    movie_id_arr = movie_id_arr[order]
+    rating_arr = rating_arr[order]
+    timestamp_arr = timestamp_arr[order]
 
     if deduplicate_user_movie:
         user_id_arr, movie_id_arr, rating_arr, timestamp_arr = deduplicate_keep_last_sorted(
@@ -813,10 +813,6 @@ def main() -> None:
     }
 
     pending_user_arrays: Optional[Dict[str, np.ndarray]] = None
-
-    rows, chunks = estimate_chunks("/data/raw/non_s3/ratings.csv", chunksize)
-    print(f"[PRECHECK] rows={rows}, estimated_chunks={chunks}")
-    return
 
     print(f"[{job_name}] start reading ratings: {ratings_path}")
     for chunk_idx, raw_chunk in enumerate(csv_chunks_from_input(ratings_path, chunksize), start=1):
