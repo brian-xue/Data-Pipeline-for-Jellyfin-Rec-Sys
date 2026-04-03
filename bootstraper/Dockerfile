@@ -23,4 +23,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scripts/ ./scripts/
 
-CMD ["sh", "-c", "python scripts/build_embedding_text.py && python scripts/emdding.py && python scripts/build_initial_user.py && python scripts/build_offline_samples.py"]
+# CMD ["sh", "-c", "python scripts/build_embedding_text.py && python scripts/emdding.py && python scripts/build_initial_user.py && python scripts/build_offline_samples.py"]
