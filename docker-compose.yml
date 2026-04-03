@@ -96,6 +96,7 @@ services:
       - /mnt/block/cache:/data/cache
       - /mnt/object/minio_data/warehouse:/data/warehouse
       - /mnt/object/minio_data:/data
+      - /mnt/object/tmp:/data/tmp
       - ./pipeline:/app
     working_dir: /app
     # Execute ingestion script then exit

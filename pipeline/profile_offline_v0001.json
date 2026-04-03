@@ -1,0 +1,120 @@
+{
+  "created_at": "2026-04-02T19:26:19.435514+00:00",
+  "input": {
+    "input_source": "s3://warehouse/dataset/offline_positive_samples/versions/v0001/parts",
+    "input_kind": "parts_prefix",
+    "time_column": "timestamp",
+    "user_column": "user_id",
+    "movie_column": "movie_id",
+    "label_column": "label",
+    "user_embedding_column": "user_embedding",
+    "movie_embedding_column": "movie_embedding"
+  },
+  "runtime": {
+    "duckdb_memory_limit": "2GB",
+    "duckdb_threads": 4,
+    "temp_directory": "/data/tmp/duckdb_profile",
+    "embedding_sample_rows": 100000
+  },
+  "s3": {
+    "endpoint": "http://minio:9000",
+    "region": "eu-central-1",
+    "use_ssl": false,
+    "url_style": "path"
+  },
+  "dataset_overview": {
+    "total_rows": 9683647,
+    "min_time": 823185259,
+    "max_time": 1697164147,
+    "approx_distinct_users": 203033,
+    "approx_distinct_movies": 73742
+  },
+  "embedding_similarity_sample_histogram": [
+    {
+      "sim_bin": 0.45,
+      "sample_count": 2,
+      "avg_label": 1.25,
+      "min_label": 1.0,
+      "max_label": 1.5,
+      "avg_cosine_sim": 0.48935597923437535
+    },
+    {
+      "sim_bin": 0.5,
+      "sample_count": 66,
+      "avg_label": 3.106060606060606,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.5341733533581778
+    },
+    {
+      "sim_bin": 0.55,
+      "sample_count": 640,
+      "avg_label": 3.04453125,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.5823737747543388
+    },
+    {
+      "sim_bin": 0.6,
+      "sample_count": 4069,
+      "avg_label": 3.0885967068075693,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.6313779726873027
+    },
+    {
+      "sim_bin": 0.65,
+      "sample_count": 17013,
+      "avg_label": 3.248104390760007,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.6799655367528223
+    },
+    {
+      "sim_bin": 0.7,
+      "sample_count": 45465,
+      "avg_label": 3.3646101396678763,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.7279777141942817
+    },
+    {
+      "sim_bin": 0.75,
+      "sample_count": 68212,
+      "avg_label": 3.4831994370491994,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.7754722359574706
+    },
+    {
+      "sim_bin": 0.8,
+      "sample_count": 49254,
+      "avg_label": 3.6208531286799044,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.8214068479883998
+    },
+    {
+      "sim_bin": 0.85,
+      "sample_count": 9042,
+      "avg_label": 3.7753262552532627,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.8637182961759596
+    },
+    {
+      "sim_bin": 0.9,
+      "sample_count": 118,
+      "avg_label": 4.190677966101695,
+      "min_label": 0.5,
+      "max_label": 5.0,
+      "avg_cosine_sim": 0.9083071997580635
+    }
+  ],
+  "resolved_latest": {
+    "source_registry": null,
+    "source_version": null,
+    "input_source": "s3://warehouse/dataset/offline_positive_samples/versions/v0001/parts",
+    "input_kind": "parts_prefix"
+  }
+}

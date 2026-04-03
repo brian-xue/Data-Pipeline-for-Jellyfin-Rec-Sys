@@ -1,0 +1,30 @@
+input:
+  input_source: s3://warehouse/dataset/offline_positive_samples/versions/v0001/parts
+  input_kind: parts_prefix
+
+output:
+  profile_json: /app/profile_offline_v0001.json
+
+profile:
+  time_column: timestamp
+  user_column: user_id
+  movie_column: movie_id
+  label_column: label
+  user_embedding_column: user_embedding
+  movie_embedding_column: movie_embedding
+  enable_user_stats: false
+  enable_movie_stats: false
+  enable_label_histogram: false
+  enable_embedding_similarity_sample: true
+
+runtime:
+  duckdb_memory_limit: 2GB
+  duckdb_threads: 4
+  temp_directory: /data/tmp/duckdb_profile
+  embedding_sample_rows: 100000
+
+s3:
+  endpoint: http://minio:9000
+  region: eu-central-1
+  use_ssl: false
+  url_style: path

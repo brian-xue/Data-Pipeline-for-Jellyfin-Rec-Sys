@@ -1,0 +1,144 @@
+{
+  "created_at": "2026-04-02T18:29:19.017304+00:00",
+  "input": {
+    "input_source": "s3://warehouse/dataset/offline_positive_samples/versions/v0001/parts",
+    "input_kind": "parts_prefix",
+    "time_column": "timestamp",
+    "user_column": "user_id",
+    "movie_column": "movie_id",
+    "label_column": "label",
+    "user_embedding_column": "user_embedding",
+    "movie_embedding_column": "movie_embedding"
+  },
+  "runtime": {
+    "duckdb_memory_limit": "2GB",
+    "duckdb_threads": 4,
+    "temp_directory": "/data/tmp/duckdb_profile",
+    "embedding_sample_rows": 100000
+  },
+  "s3": {
+    "endpoint": "http://minio:9000",
+    "region": "eu-central-1",
+    "use_ssl": false,
+    "url_style": "path"
+  },
+  "dataset_overview": {
+    "total_rows": 9683647,
+    "min_time": 823185259,
+    "max_time": 1697164147,
+    "approx_distinct_users": 203033,
+    "approx_distinct_movies": 73742
+  },
+  "label_stats": {
+    "label_min": 0.5,
+    "label_max": 5.0,
+    "label_avg": 3.476238239580604,
+    "label_std": 1.0550093756080166,
+    "label_p01": 0.5,
+    "label_p10": 2.0,
+    "label_p50": 3.5,
+    "label_p90": 5.0,
+    "label_p99": 5.0
+  },
+  "label_histogram": [
+    {
+      "label_value": 0.5,
+      "row_count": 173156
+    },
+    {
+      "label_value": 1.0,
+      "row_count": 302787
+    },
+    {
+      "label_value": 1.5,
+      "row_count": 177439
+    },
+    {
+      "label_value": 2.0,
+      "row_count": 642012
+    },
+    {
+      "label_value": 2.5,
+      "row_count": 572780
+    },
+    {
+      "label_value": 3.0,
+      "row_count": 1882719
+    },
+    {
+      "label_value": 3.5,
+      "row_count": 1405901
+    },
+    {
+      "label_value": 4.0,
+      "row_count": 2459174
+    },
+    {
+      "label_value": 4.5,
+      "row_count": 905470
+    },
+    {
+      "label_value": 5.0,
+      "row_count": 1162209
+    }
+  ],
+  "embedding_shape_sample_stats": {
+    "sampled_rows": 100000,
+    "user_emb_dim_min": 384,
+    "user_emb_dim_max": 384,
+    "user_emb_dim_p50": 384,
+    "movie_emb_dim_min": 384,
+    "movie_emb_dim_max": 384,
+    "movie_emb_dim_p50": 384
+  },
+  "embedding_similarity_sample_stats": {
+    "sampled_rows": 100000,
+    "sim_min": 0.4608013987409406,
+    "sim_max": 0.9313154834818166,
+    "sim_avg": 0.7680701431760801,
+    "sim_std": 0.05427446034978868,
+    "sim_p01": 0.6258772783909631,
+    "sim_p10": 0.6954477356039315,
+    "sim_p50": 0.7722436144268848,
+    "sim_p90": 0.8349299264965997,
+    "sim_p99": 0.8726723495855164
+  },
+  "time_sample_extremes": [
+    {
+      "time_value": 823185259
+    },
+    {
+      "time_value": 823185264
+    },
+    {
+      "time_value": 823185265
+    },
+    {
+      "time_value": 823264414
+    },
+    {
+      "time_value": 823264414
+    },
+    {
+      "time_value": 1697164147
+    },
+    {
+      "time_value": 1697164098
+    },
+    {
+      "time_value": 1697164060
+    },
+    {
+      "time_value": 1697163970
+    },
+    {
+      "time_value": 1697163923
+    }
+  ],
+  "resolved_latest": {
+    "source_registry": null,
+    "source_version": null,
+    "input_source": "s3://warehouse/dataset/offline_positive_samples/versions/v0001/parts",
+    "input_kind": "parts_prefix"
+  }
+}

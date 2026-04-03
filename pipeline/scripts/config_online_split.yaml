@@ -1,0 +1,40 @@
+job:
+  name: split_online_dataset_v1
+
+dataset:
+  type: online
+
+input:
+  online_root_dir: s3://warehouse/dataset/online_events
+
+output:
+  root_dir: s3://warehouse/dataset/split_dataset
+
+split:
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+
+columns:
+  user_id: user_id
+  movie_id: movie_id
+  timestamp: timestamp
+  user_embedding: user_embedding
+  movie_embedding: movie_embedding
+  label: label   # ⭐ 这里 label = play_time / dwell_time
+
+label_transform:
+  keep_source_label: true
+
+  online:
+    play_time_cap: 600.0   # ⭐ 防长尾爆炸
+
+runtime:
+  batch_size: 500000
+
+storage:
+  s3:
+    endpoint: http://minio:9000
+    access_key_id: minioadmin
+    secret_access_key: minioadmin
+    use_ssl: false

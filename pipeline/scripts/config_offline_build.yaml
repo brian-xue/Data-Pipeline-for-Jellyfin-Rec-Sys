@@ -1,0 +1,38 @@
+job:
+  name: build_offline_positive_samples_v0
+
+input:
+  base_user_profiles_path: s3://artifacts/bootstraper_v0_embedding/base_user_profiles.parquet
+  remaining_user_events_path: s3://artifacts/bootstraper_v0_embedding/remaining_user_events.parquet
+  movie_embedding_path: s3://embedding/movie_embeddings.parquet
+
+user_embedding:
+  long_weight: 0.4
+  short_weight: 0.6
+
+runtime:
+  profile_batch_size: 5000
+  iceberg_append_batch_rows: 1000
+  local_tmp_dir: /data/tmp
+
+output:
+  warehouse_dir: s3://warehouse/dataset/offline_positive_samples
+  write_parquet: true
+
+iceberg:
+  enabled: false
+  catalog_name: default
+  namespace: recsys
+  table_name: offline_positive_samples
+  uri: sqlite:////data/warehouse/dataset/offline_iceberg_catalog.db
+  s3_endpoint: http://minio:9000
+  s3_access_key: minioadmin
+  s3_secret_key: minioadmin123
+  warehouse: s3://warehouse
+
+environment:
+  POSTGRES_HOST: postgres
+  MINIO_ENDPOINT: http://minio:9000
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin123
+  AWS_REGION: eu-central-1

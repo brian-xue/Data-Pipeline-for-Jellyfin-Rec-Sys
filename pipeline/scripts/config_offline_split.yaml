@@ -1,0 +1,50 @@
+job:
+  name: split_offline_dataset_v1
+
+dataset:
+  type: offline
+
+input:
+  offline_root_dir: s3://warehouse/dataset/offline_positive_samples
+
+output:
+  root_dir: s3://warehouse/dataset/versioned_dataset
+
+split:
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+
+columns:
+  user_id: user_id
+  movie_id: movie_id
+  timestamp: timestamp
+  user_embedding: user_embedding
+  movie_embedding: movie_embedding
+  label: label
+
+label_transform:
+  keep_source_label: true
+
+  offline:
+    sigmoid_k: 5.0
+    sigmoid_c: 0.5
+    jitter_amplitude: 0.1
+
+  online:
+    play_time_cap: 600.0
+
+runtime:
+  batch_size: 100000
+  target_rows_per_file: 50000
+  upload_max_retries: 5
+  upload_base_sleep_seconds: 1.0
+  local_checkpoint_path: scripts/checkpoints/split_dataset_checkpoint.json
+
+storage:
+  s3:
+    endpoint: http://minio:9000
+    region: eu-central-1
+    access_key_id: minioadmin
+    secret_access_key: minioadmin123
+    use_ssl: false

@@ -8,9 +8,19 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN apt-get update && apt-get install -y \
+    gcc \
+    python3-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/ ./scripts/
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# RUN pip install --no-cache-dir "numpy<2.0.0" "pyarrow>=14.0.0" "fsspec==2023.9.0"
 
-CMD ["python", "scripts/ingest_datasets.py"]
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY scripts/ ./scripts//
+
+# CMD ["python", "scripts/ingest_datasets.py"]
