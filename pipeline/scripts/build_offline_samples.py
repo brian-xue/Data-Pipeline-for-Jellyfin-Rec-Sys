@@ -1,25 +1,66 @@
 import os
 import json
-import argparse
 import shutil
+import argparse
+import tempfile
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional
+
+import re
 
 import duckdb
+import numpy as np
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+import s3fs
 import yaml
 
-
-UINT64_MAX = 18446744073709551615.0
-DEFAULT_SIGMOID_K = 5.0
-DEFAULT_SIGMOID_C = 0.5
-DEFAULT_JITTER_AMPLITUDE = 0.1
+from pyiceberg.catalog import load_catalog
+from pyiceberg.schema import Schema
+from pyiceberg.types import (
+    NestedField,
+    LongType,
+    DoubleType,
+    TimestampType,
+    TimestamptzType,
+    IntegerType,
+    ListType,
+    FloatType,
+    StringType,
+)
 
 
 # ============================================================
 # Utils
 # ============================================================
+DEFAULT_MINIO_ENDPOINT = "http://minio:9000"
+
+
+def resolve_config_path(path: str) -> str:
+    if os.path.isabs(path) and os.path.exists(path):
+        return path
+
+    candidates = [
+        path,
+        os.path.join(os.getcwd(), path),
+        os.path.join(os.getcwd(), "scripts", path),
+        os.path.join(os.path.dirname(__file__), path),
+    ]
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        f"Config file not found: {path}. Tried: {candidates}"
+    )
+
+
 def load_yaml_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+    config_path = resolve_config_path(path)
+    with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -33,10 +74,224 @@ def deep_get(d: Dict[str, Any], keys: List[str], default=None):
 
 
 def ensure_dir(path: str) -> None:
-    if path:
-        os.makedirs(path, exist_ok=True)
+    os.makedirs(path, exist_ok=True)
 
 
+def reset_dir(path: str) -> None:
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path, exist_ok=True)
+
+
+def bucket_mapping() -> Dict[str, str]:
+    return {
+        "raw": os.getenv("MINIO_RAW_BUCKET", "raw"),
+        "cleaned": os.getenv("MINIO_CLEANED_BUCKET", "cleaned"),
+        "embedding": os.getenv("MINIO_EMBEDDING_BUCKET", "embedding"),
+        "artifacts": os.getenv("MINIO_ARTIFACTS_BUCKET", "artifacts"),
+        "warehouse": os.getenv("MINIO_WAREHOUSE_BUCKET", "warehouse"),
+    }
+
+
+def s3_storage_options() -> Dict[str, Any]:
+    endpoint = os.getenv("MINIO_ENDPOINT", DEFAULT_MINIO_ENDPOINT)
+    key = (
+        os.getenv("MINIO_ACCESS_KEY")
+        or os.getenv("AWS_ACCESS_KEY_ID")
+        or os.getenv("MINIO_ROOT_USER")
+    )
+    secret = (
+        os.getenv("MINIO_SECRET_KEY")
+        or os.getenv("AWS_SECRET_ACCESS_KEY")
+        or os.getenv("MINIO_ROOT_PASSWORD")
+    )
+
+    options: Dict[str, Any] = {
+        "client_kwargs": {"endpoint_url": endpoint},
+    }
+    if key:
+        options["key"] = key
+    if secret:
+        options["secret"] = secret
+    return options
+
+
+def s3_filesystem() -> s3fs.S3FileSystem:
+    opts = s3_storage_options()
+    return s3fs.S3FileSystem(
+        key=opts.get("key"),
+        secret=opts.get("secret"),
+        client_kwargs=opts.get("client_kwargs"),
+    )
+
+
+def local_data_path_to_s3_uri(path_like: str) -> Optional[str]:
+    if path_like.startswith("s3://"):
+        return path_like
+
+    try:
+        path_obj = Path(path_like).resolve()
+    except Exception:
+        path_obj = Path(path_like)
+
+    parts = path_obj.parts
+    if len(parts) < 3 or parts[0] != "/" or parts[1] != "data":
+        return None
+
+    top_level = parts[2]
+    mapped_bucket = bucket_mapping().get(top_level)
+    if mapped_bucket is None:
+        return None
+
+    key = PurePosixPath(*parts[3:]).as_posix()
+    if key in {"", "."}:
+        return f"s3://{mapped_bucket}"
+    return f"s3://{mapped_bucket}/{key}"
+
+
+def to_s3_uri(path_like: str) -> str:
+    if path_like.startswith("s3://"):
+        return path_like
+    mapped = local_data_path_to_s3_uri(path_like)
+    if mapped is None:
+        raise ValueError(f"Path cannot be mapped to MinIO bucket: {path_like}")
+    return mapped
+
+
+def resolve_input_path(path_like: str) -> str:
+    if path_like.startswith("s3://"):
+        return path_like
+    if os.path.exists(path_like):
+        return path_like
+    mapped = local_data_path_to_s3_uri(path_like)
+    return mapped if mapped is not None else path_like
+
+
+def materialize_input_to_local(path_like: str, local_path: str) -> str:
+    resolved = resolve_input_path(path_like)
+    if not resolved.startswith("s3://"):
+        if not os.path.exists(resolved):
+            raise FileNotFoundError(f"Input file not found: {resolved}")
+        if os.path.isdir(resolved):
+            return materialize_parquet_dataset_to_local_file(
+                source=resolved,
+                local_path=local_path,
+            )
+        return resolved
+
+    fs = s3_filesystem()
+    src = resolved.replace("s3://", "")
+    if not fs.exists(src):
+        if src.endswith("movie_embedding.parquet"):
+            alt_src = src.replace("movie_embedding.parquet", "movie_embeddings.parquet")
+            if fs.exists(alt_src):
+                src = alt_src
+            else:
+                raise FileNotFoundError(
+                    f"S3 input file not found: {src}. Also tried: {alt_src}"
+                )
+        else:
+            raise FileNotFoundError(f"S3 input file not found: {src}")
+
+    if is_s3_directory_like(fs, src):
+        return materialize_parquet_dataset_to_local_file(
+            source=resolved,
+            local_path=local_path,
+            filesystem=fs,
+        )
+
+    ensure_dir(os.path.dirname(local_path))
+    with fs.open(src, "rb") as src_handle, open(local_path, "wb") as dst_handle:
+        shutil.copyfileobj(src_handle, dst_handle)
+    return local_path
+
+
+def is_s3_directory_like(fs: s3fs.S3FileSystem, src: str) -> bool:
+    try:
+        if fs.isdir(src):
+            return True
+    except Exception:
+        pass
+
+    prefix = src.rstrip("/")
+    try:
+        children = fs.ls(prefix, detail=False)
+        return len(children) > 0
+    except Exception:
+        return False
+
+
+def materialize_parquet_dataset_to_local_file(
+    source: str,
+    local_path: str,
+    filesystem: Optional[s3fs.S3FileSystem] = None,
+) -> str:
+    ensure_dir(os.path.dirname(local_path))
+
+    if filesystem is None:
+        dataset = ds.dataset(source, format="parquet")
+    else:
+        dataset = ds.dataset(source, format="parquet", filesystem=filesystem)
+
+    scanner = dataset.scanner(batch_size=50000)
+    writer = pq.ParquetWriter(local_path, dataset.schema, compression="zstd")
+    try:
+        for record_batch in scanner.to_batches():
+            writer.write_table(pa.Table.from_batches([record_batch], schema=dataset.schema))
+    finally:
+        writer.close()
+
+    return local_path
+
+
+def upload_file_to_s3(local_file: str, target_path: str) -> str:
+    target_uri = to_s3_uri(target_path)
+    fs = s3_filesystem()
+    fs_path = target_uri.replace("s3://", "")
+    parent = str(PurePosixPath(fs_path).parent)
+    if parent and parent != ".":
+        fs.makedirs(parent, exist_ok=True)
+
+    with open(local_file, "rb") as src_handle, fs.open(fs_path, "wb") as dst_handle:
+        shutil.copyfileobj(src_handle, dst_handle)
+
+    return target_uri
+
+
+def upload_bytes_to_s3(payload: bytes, target_path: str) -> str:
+    target_uri = to_s3_uri(target_path)
+    fs = s3_filesystem()
+    fs_path = target_uri.replace("s3://", "")
+    parent = str(PurePosixPath(fs_path).parent)
+    if parent and parent != ".":
+        fs.makedirs(parent, exist_ok=True)
+
+    with fs.open(fs_path, "wb") as handle:
+        handle.write(payload)
+
+    return target_uri
+
+
+def ensure_output_dir(path_like: str) -> None:
+    if path_like.startswith("s3://"):
+        fs = s3_filesystem()
+        fs.makedirs(path_like.replace("s3://", ""), exist_ok=True)
+        return
+
+    try:
+        mapped_s3 = to_s3_uri(path_like)
+        fs = s3_filesystem()
+        fs.makedirs(mapped_s3.replace("s3://", ""), exist_ok=True)
+        return
+    except Exception:
+        pass
+
+    ensure_dir(path_like)
+
+
+# ============================================================
+# Preflight checks
+# ============================================================
 def require_value(name: str, value: Any) -> None:
     if value is None:
         raise ValueError(f"Missing required config: {name}")
@@ -44,572 +299,567 @@ def require_value(name: str, value: Any) -> None:
         raise ValueError(f"Empty required config: {name}")
 
 
-def is_s3_path(path: str) -> bool:
-    return isinstance(path, str) and path.startswith("s3://")
+def validate_local_dir_writable(path: str) -> None:
+    ensure_dir(path)
+    test_path = os.path.join(path, ".write_test")
+    try:
+        with open(test_path, "wb") as f:
+            f.write(b"ok")
+    finally:
+        try:
+            if os.path.exists(test_path):
+                os.remove(test_path)
+        except Exception:
+            pass
 
 
+def validate_local_dir_has_space(path: str, min_free_gb: float = 1.0) -> None:
+    usage = shutil.disk_usage(path)
+    free_gb = usage.free / (1024 ** 3)
+    if free_gb < min_free_gb:
+        raise RuntimeError(
+            f"Insufficient free space under {path}: {free_gb:.2f} GiB available, "
+            f"require at least {min_free_gb:.2f} GiB"
+        )
+
+
+def validate_s3_or_local_path_exists(path_like: str) -> None:
+    resolved = resolve_input_path(path_like)
+
+    if not resolved.startswith("s3://"):
+        if not os.path.exists(resolved):
+            raise FileNotFoundError(f"Input path not found: {resolved}")
+        return
+
+    fs = s3_filesystem()
+    fs_path = resolved.replace("s3://", "")
+    if fs.exists(fs_path):
+        return
+
+    if fs_path.endswith("movie_embedding.parquet"):
+        alt_path = fs_path.replace("movie_embedding.parquet", "movie_embeddings.parquet")
+        if fs.exists(alt_path):
+            return
+
+    raise FileNotFoundError(f"S3 input path not found: {resolved}")
+
+
+def get_parquet_schema_names(path_like: str) -> List[str]:
+    resolved = resolve_input_path(path_like)
+
+    if resolved.startswith("s3://"):
+        fs = s3_filesystem()
+        src = resolved.replace("s3://", "")
+
+        if not fs.exists(src) and src.endswith("movie_embedding.parquet"):
+            alt_src = src.replace("movie_embedding.parquet", "movie_embeddings.parquet")
+            if fs.exists(alt_src):
+                src = alt_src
+                resolved = f"s3://{src}"
+
+        if is_s3_directory_like(fs, src):
+            dataset = ds.dataset(resolved, format="parquet", filesystem=fs)
+            return dataset.schema.names
+
+        with fs.open(src, "rb") as f:
+            parquet_file = pq.ParquetFile(f)
+            return parquet_file.schema_arrow.names
+
+    if os.path.isdir(resolved):
+        dataset = ds.dataset(resolved, format="parquet")
+        return dataset.schema.names
+
+    parquet_file = pq.ParquetFile(resolved)
+    return parquet_file.schema_arrow.names
+
+
+def validate_required_columns(path_like: str, required_columns: List[str], label: str) -> None:
+    names = set(get_parquet_schema_names(path_like))
+    missing = [col for col in required_columns if col not in names]
+    if missing:
+        raise ValueError(
+            f"{label} missing required columns: {missing}. "
+            f"Existing columns: {sorted(names)}"
+        )
+
+
+def run_preflight_checks(cfg: Dict[str, Any]) -> None:
+    # Required config
+    require_value("input.base_user_profiles_path", deep_get(cfg, ["input", "base_user_profiles_path"]))
+    require_value("input.remaining_user_events_path", deep_get(cfg, ["input", "remaining_user_events_path"]))
+    require_value("input.movie_embedding_path", deep_get(cfg, ["input", "movie_embedding_path"]))
+
+    require_value("iceberg.catalog_name", deep_get(cfg, ["iceberg", "catalog_name"]))
+    require_value("iceberg.namespace", deep_get(cfg, ["iceberg", "namespace"]))
+    require_value("iceberg.table_name", deep_get(cfg, ["iceberg", "table_name"]))
+    require_value("iceberg.uri", deep_get(cfg, ["iceberg", "uri"]))
+    require_value("iceberg.warehouse", deep_get(cfg, ["iceberg", "warehouse"]))
+
+    # Weight validation
+    long_weight = float(deep_get(cfg, ["user_embedding", "long_weight"], 0.4))
+    short_weight = float(deep_get(cfg, ["user_embedding", "short_weight"], 0.6))
+    if long_weight < 0 or short_weight < 0:
+        raise ValueError("user_embedding.long_weight and short_weight must be non-negative")
+    if long_weight == 0 and short_weight == 0:
+        raise ValueError("user_embedding.long_weight and short_weight cannot both be 0")
+
+    # Runtime tmp dir validation
+    local_tmp_dir = deep_get(cfg, ["runtime", "local_tmp_dir"], "/mnt/block/tmp")
+    validate_local_dir_writable(local_tmp_dir)
+    validate_local_dir_has_space(local_tmp_dir, min_free_gb=1.0)
+
+    # Input path validation
+    base_user_profiles_path = deep_get(cfg, ["input", "base_user_profiles_path"])
+    remaining_user_events_path = deep_get(cfg, ["input", "remaining_user_events_path"])
+    movie_embedding_path = deep_get(cfg, ["input", "movie_embedding_path"])
+
+    validate_s3_or_local_path_exists(base_user_profiles_path)
+    validate_s3_or_local_path_exists(remaining_user_events_path)
+    validate_s3_or_local_path_exists(movie_embedding_path)
+
+    # Schema validation
+    validate_required_columns(
+        base_user_profiles_path,
+        ["user_id", "long_term_embedding", "short_term_embedding", "profile_version"],
+        "base_user_profiles",
+    )
+    validate_required_columns(
+        remaining_user_events_path,
+        ["user_id", "movie_id", "timestamp", "event_time", "future_event_order", "rating"],
+        "remaining_user_events",
+    )
+    validate_required_columns(
+        movie_embedding_path,
+        ["movieId", "embedding"],
+        "movie_embedding",
+    )
+
+
+# ===============================
+# Versioning helpers
+# ===============================
 def get_registry_json(registry_path: str) -> dict:
-    if is_s3_path(registry_path):
-        raise ValueError("S3 registry JSON is not supported by the pure-Python registry helper. Use a local metadata root.")
-    if not os.path.exists(registry_path):
+    fs = s3_filesystem()
+    fs_path = registry_path.replace("s3://", "")
+    if not fs.exists(fs_path):
         return {"versions": [], "latest": None}
-    with open(registry_path, "r", encoding="utf-8") as f:
+    with fs.open(fs_path, "rb") as f:
         try:
             return json.load(f)
         except Exception:
             return {"versions": [], "latest": None}
 
 
-def save_registry_json(registry_path: str, registry: dict) -> None:
-    if is_s3_path(registry_path):
-        raise ValueError("S3 registry JSON is not supported by the pure-Python registry helper. Use a local metadata root.")
-    ensure_dir(os.path.dirname(registry_path))
-    with open(registry_path, "w", encoding="utf-8") as f:
-        json.dump(registry, f, indent=2, ensure_ascii=False)
+def save_registry_json(registry_path: str, registry: dict) -> str:
+    payload = json.dumps(registry, indent=2, ensure_ascii=False).encode("utf-8")
+    return upload_bytes_to_s3(payload, registry_path)
 
 
-def next_version_name(existing_versions: List[dict]) -> str:
+def parse_version_number(version: str) -> int | None:
+    if not isinstance(version, str):
+        return None
+    m = re.match(r"^v(\d+)$", version.strip())
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def next_version_name(existing_versions: list, latest_version: str | None = None) -> str:
     max_num = 0
-    for item in existing_versions:
-        version = item.get("version", "")
-        if version.startswith("v") and version[1:].isdigit():
-            max_num = max(max_num, int(version[1:]))
+
+    latest_num = parse_version_number(latest_version or "")
+    if latest_num is not None:
+        max_num = max(max_num, latest_num)
+
+    for v in existing_versions:
+        current_num = parse_version_number(v.get("version", ""))
+        if current_num is not None:
+            max_num = max(max_num, current_num)
+
     return f"v{max_num + 1:04d}"
 
 
 # ============================================================
-# DuckDB / S3
+# Fused user embedding schema
 # ============================================================
-def sql_quote(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
+FUSED_USER_SCHEMA = pa.schema([
+    pa.field("user_id", pa.int64()),
+    pa.field("user_embedding", pa.list_(pa.float32())),
+    pa.field("profile_version", pa.string()),
+])
 
 
-def configure_duckdb_runtime(con: duckdb.DuckDBPyConnection, cfg: Dict[str, Any]) -> None:
-    runtime_cfg = deep_get(cfg, ["runtime"], {}) or {}
+# ============================================================
+# Iceberg schema for final dataset
+# ============================================================
+def offline_positive_samples_iceberg_schema() -> Schema:
+    return Schema(
+        NestedField(1, "user_id", LongType(), required=False),
+        NestedField(2, "movie_id", LongType(), required=False),
+        NestedField(3, "timestamp", LongType(), required=False),
+        NestedField(4, "event_time", TimestamptzType(), required=False),
+        NestedField(5, "future_event_order", IntegerType(), required=False),
+        NestedField(6, "label", DoubleType(), required=False),
+        NestedField(
+            7,
+            "user_embedding",
+            ListType(
+                element_id=8,
+                element_type=FloatType(),
+                element_required=False,
+            ),
+            required=False,
+        ),
+        NestedField(
+            9,
+            "movie_embedding",
+            ListType(
+                element_id=10,
+                element_type=DoubleType(),
+                element_required=False,
+            ),
+            required=False,
+        ),
+        NestedField(11, "profile_version", StringType(), required=False),
+    )
 
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
+
+# ============================================================
+# Incremental parquet writer
+# ============================================================
+class IncrementalParquetWriter:
+    def __init__(self, path: str, schema: pa.Schema):
+        self.path = path
+        self.schema = schema
+        self.writer: Optional[pq.ParquetWriter] = None
+        ensure_dir(os.path.dirname(path))
+
+    def write_rows(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        table = rows_to_arrow(rows, self.schema)
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(
+                self.path,
+                self.schema,
+                compression="zstd",
+            )
+        self.writer.write_table(table)
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+
+def rows_to_arrow(rows: List[Dict[str, Any]], schema: pa.Schema) -> pa.Table:
+    cols = {}
+    for field in schema:
+        vals = [row.get(field.name) for row in rows]
+        cols[field.name] = pa.array(vals, type=field.type)
+    return pa.Table.from_pydict(cols, schema=schema)
+
+
+# ============================================================
+# Embedding fusion
+# ============================================================
+def to_numpy_or_none(x) -> Optional[np.ndarray]:
+    if x is None:
+        return None
+    try:
+        arr = np.asarray(x, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.ndim != 1:
+        return None
+    return arr
+
+
+def fuse_user_embedding(
+    long_emb,
+    short_emb,
+    long_weight: float,
+    short_weight: float,
+) -> Optional[List[float]]:
+    long_vec = to_numpy_or_none(long_emb)
+    short_vec = to_numpy_or_none(short_emb)
+
+    if long_vec is not None and short_vec is not None:
+        if long_vec.shape != short_vec.shape:
+            return None
+        fused = long_weight * long_vec + short_weight * short_vec
+        return fused.astype(np.float32).tolist()
+
+    if short_vec is not None:
+        return short_vec.astype(np.float32).tolist()
+
+    if long_vec is not None:
+        return long_vec.astype(np.float32).tolist()
+
+    return None
+
+
+# ============================================================
+# Step 1: Stream base_user_profiles -> fused_user_embeddings.parquet
+# ============================================================
+def build_fused_user_embeddings(
+    base_user_profiles_path: str,
+    fused_user_embeddings_path: str,
+    batch_size: int,
+    long_weight: float,
+    short_weight: float,
+) -> Dict[str, int]:
+    writer = IncrementalParquetWriter(fused_user_embeddings_path, FUSED_USER_SCHEMA)
+
+    stats = {
+        "profile_rows_seen": 0,
+        "fused_user_rows_written": 0,
+        "dropped_missing_embedding_rows": 0,
+    }
+
+    source_path = base_user_profiles_path
+    if os.path.isdir(base_user_profiles_path):
+        source_path = materialize_parquet_dataset_to_local_file(
+            source=base_user_profiles_path,
+            local_path=f"{fused_user_embeddings_path}.base_profiles.tmp.parquet",
+        )
+
+    parquet_file = pq.ParquetFile(source_path)
 
     try:
-        con.execute("INSTALL aws;")
-        con.execute("LOAD aws;")
-    except Exception:
-        pass
+        for record_batch in parquet_file.iter_batches(
+            batch_size=batch_size,
+            columns=["user_id", "long_term_embedding", "short_term_embedding", "profile_version"],
+        ):
+            table = pa.Table.from_batches([record_batch])
+            rows = table.to_pylist()
 
-    threads = runtime_cfg.get("threads")
-    if threads:
-        con.execute(f"SET threads = {int(threads)};")
+            out_rows: List[Dict[str, Any]] = []
 
-    temp_directory = runtime_cfg.get("temp_directory")
-    if temp_directory:
-        ensure_dir(temp_directory)
-        con.execute(f"SET temp_directory = {sql_quote(temp_directory)};")
+            for row in rows:
+                stats["profile_rows_seen"] += 1
 
-    memory_limit = runtime_cfg.get("memory_limit")
-    if memory_limit:
-        con.execute(f"SET memory_limit = {sql_quote(str(memory_limit))};")
-
-    preserve_insertion_order = runtime_cfg.get("preserve_insertion_order")
-    if preserve_insertion_order is not None:
-        flag = "true" if bool(preserve_insertion_order) else "false"
-        con.execute(f"SET preserve_insertion_order = {flag};")
-
-    s3_cfg = deep_get(cfg, ["storage", "s3"], {}) or {}
-    if not s3_cfg:
-        return
-
-    use_secret = bool(s3_cfg.get("use_secret", False))
-    secret_name = s3_cfg.get("secret_name", "recsys_s3")
-
-    endpoint = s3_cfg.get("endpoint")
-    region = s3_cfg.get("region")
-    url_style = s3_cfg.get("url_style")
-    use_ssl = s3_cfg.get("use_ssl")
-    key_id = s3_cfg.get("access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
-    secret = s3_cfg.get("secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
-    session_token = s3_cfg.get("session_token") or os.getenv("AWS_SESSION_TOKEN")
-
-    if use_secret:
-        parts = [
-            f"CREATE OR REPLACE SECRET {secret_name} (",
-            "TYPE s3",
-        ]
-        if key_id:
-            parts.append(f", KEY_ID {sql_quote(key_id)}")
-        if secret:
-            parts.append(f", SECRET {sql_quote(secret)}")
-        if session_token:
-            parts.append(f", SESSION_TOKEN {sql_quote(session_token)}")
-        if region:
-            parts.append(f", REGION {sql_quote(region)}")
-        if endpoint:
-            parts.append(f", ENDPOINT {sql_quote(endpoint)}")
-        if url_style:
-            parts.append(f", URL_STYLE {sql_quote(url_style)}")
-        if use_ssl is not None:
-            parts.append(f", USE_SSL {'true' if bool(use_ssl) else 'false'}")
-        parts.append(")")
-        con.execute("".join(parts))
-    else:
-        if region:
-            con.execute(f"SET s3_region = {sql_quote(region)};")
-        if endpoint:
-            con.execute(f"SET s3_endpoint = {sql_quote(endpoint)};")
-        if url_style:
-            con.execute(f"SET s3_url_style = {sql_quote(url_style)};")
-        if key_id:
-            con.execute(f"SET s3_access_key_id = {sql_quote(key_id)};")
-        if secret:
-            con.execute(f"SET s3_secret_access_key = {sql_quote(secret)};")
-        if session_token:
-            con.execute(f"SET s3_session_token = {sql_quote(session_token)};")
-        if use_ssl is not None:
-            con.execute(f"SET s3_use_ssl = {'true' if bool(use_ssl) else 'false'};")
-
-
-# ============================================================
-# Resolve latest input from source registry
-# ============================================================
-def resolve_latest_input_source(source_root_dir: str) -> Dict[str, str]:
-    require_value("source_root_dir", source_root_dir)
-
-    registry_path = os.path.join(source_root_dir, "registry", "versions.json")
-    registry = get_registry_json(registry_path)
-
-    latest_version = registry.get("latest")
-    if not latest_version:
-        raise ValueError(f"No latest version found in source registry: {registry_path}")
-
-    versions = registry.get("versions", [])
-    latest_entry = None
-    for item in versions:
-        if item.get("version") == latest_version:
-            latest_entry = item
-            break
-
-    if latest_entry is None:
-        raise ValueError(
-            f"Latest version '{latest_version}' not found in registry entries: {registry_path}"
-        )
-
-    data_parts_prefix = latest_entry.get("data_parts_prefix")
-    if data_parts_prefix:
-        return {
-            "source_registry": registry_path,
-            "source_version": latest_version,
-            "input_source": data_parts_prefix,
-            "input_kind": "parts_prefix",
-        }
-
-    data_parquet = latest_entry.get("data_parquet")
-    if data_parquet:
-        return {
-            "source_registry": registry_path,
-            "source_version": latest_version,
-            "input_source": data_parquet,
-            "input_kind": "data_parquet",
-        }
-
-    version_dir = latest_entry.get("version_dir")
-    if version_dir:
-        parts_dir = os.path.join(version_dir, "parts")
-        if not is_s3_path(parts_dir) and os.path.isdir(parts_dir):
-            return {
-                "source_registry": registry_path,
-                "source_version": latest_version,
-                "input_source": parts_dir,
-                "input_kind": "version_dir_fallback",
-            }
-
-        data_file = os.path.join(version_dir, "data.parquet")
-        if not is_s3_path(data_file) and os.path.exists(data_file):
-            return {
-                "source_registry": registry_path,
-                "source_version": latest_version,
-                "input_source": data_file,
-                "input_kind": "version_dir_fallback",
-            }
-
-    raise ValueError(
-        f"Cannot resolve latest input dataset from source registry: {registry_path}, latest entry: {latest_entry}"
-    )
-
-
-# ============================================================
-# Parquet read helpers
-# ============================================================
-def parquet_glob_from_input(input_source: str, input_kind: str) -> str:
-    if input_kind == "parts_prefix":
-        return f"{input_source.rstrip('/')}/*.parquet"
-
-    if input_kind in {"data_parquet", "version_dir_fallback"}:
-        if is_s3_path(input_source):
-            if input_source.endswith(".parquet"):
-                return input_source
-            return f"{input_source.rstrip('/')}/*.parquet"
-        if os.path.isdir(input_source):
-            return os.path.join(input_source, "*.parquet")
-        return input_source
-
-    raise ValueError(f"Unsupported input_kind: {input_kind}")
-
-
-def parquet_read_expr(input_source: str, input_kind: str, union_by_name: bool = True) -> str:
-    glob_path = parquet_glob_from_input(input_source, input_kind)
-    return f"read_parquet({sql_quote(glob_path)}, union_by_name={'true' if union_by_name else 'false'})"
-
-
-# ============================================================
-# SQL builders
-# ============================================================
-def build_split_index_query(
-    source_expr: str,
-    user_id_col: str,
-    movie_id_col: str,
-    timestamp_col: str,
-    train_ratio: float,
-    val_ratio: float,
-) -> str:
-    train_cutoff = train_ratio
-    val_cutoff = train_ratio + val_ratio
-
-    return f"""
-    WITH light_source AS (
-        SELECT
-            {user_id_col} AS user_id,
-            {movie_id_col} AS movie_id,
-            {timestamp_col} AS event_timestamp
-        FROM {source_expr}
-    ),
-    dedup_candidates AS (
-        SELECT
-            user_id,
-            event_timestamp,
-            movie_id,
-            COUNT(*) OVER (
-                PARTITION BY user_id, event_timestamp
-            ) AS key_dup_cnt
-        FROM light_source
-    ),
-    unique_keys AS (
-        SELECT
-            user_id,
-            event_timestamp,
-            movie_id
-        FROM dedup_candidates
-        WHERE key_dup_cnt = 1
-    ),
-    ranked AS (
-        SELECT
-            user_id,
-            event_timestamp,
-            ROW_NUMBER() OVER (
-                PARTITION BY user_id
-                ORDER BY event_timestamp ASC, movie_id ASC
-            ) AS seq_order,
-            COUNT(*) OVER (
-                PARTITION BY user_id
-            ) AS total_user_rows
-        FROM unique_keys
-    )
-    SELECT
-        user_id,
-        event_timestamp,
-        CASE
-            WHEN total_user_rows = 1 THEN 'train'
-            WHEN ((CAST(seq_order AS DOUBLE) - 0.5) / total_user_rows) < {train_cutoff} THEN 'train'
-            WHEN ((CAST(seq_order AS DOUBLE) - 0.5) / total_user_rows) < {val_cutoff} THEN 'val'
-            ELSE 'test'
-        END AS dataset_split
-    FROM ranked
-    """
-
-
-def build_full_rows_query(
-    source_expr: str,
-    rating_col: str,
-    user_id_col: str,
-    movie_id_col: str,
-    timestamp_col: str,
-    user_embedding_col: str,
-    movie_embedding_col: str,
-) -> str:
-    return f"""
-    WITH full_source AS (
-        SELECT
-            {user_id_col} AS user_id,
-            {movie_id_col} AS movie_id,
-            {timestamp_col} AS event_timestamp,
-            {user_embedding_col} AS user_embedding,
-            {movie_embedding_col} AS movie_embedding,
-            CAST({rating_col} AS DOUBLE) AS rating_raw
-        FROM {source_expr}
-    ),
-    full_dedup AS (
-        SELECT
-            user_id,
-            movie_id,
-            event_timestamp,
-            user_embedding,
-            movie_embedding,
-            rating_raw,
-            COUNT(*) OVER (
-                PARTITION BY user_id, event_timestamp
-            ) AS key_dup_cnt
-        FROM full_source
-    )
-    SELECT
-        user_id,
-        movie_id,
-        event_timestamp,
-        user_embedding,
-        movie_embedding,
-        rating_raw
-    FROM full_dedup
-    WHERE key_dup_cnt = 1
-    """
-
-
-def build_labeled_joined_query(
-    full_rows_query: str,
-    sigmoid_k: float,
-    sigmoid_c: float,
-    jitter_amplitude: float,
-) -> str:
-    if jitter_amplitude <= 0 or jitter_amplitude >= 0.5:
-        raise ValueError("jitter_amplitude must be in (0, 0.5). Recommended value is 0.1.")
-
-    return f"""
-    WITH joined_rows AS (
-        SELECT
-            f.user_id,
-            f.movie_id,
-            f.event_timestamp,
-            f.user_embedding,
-            f.movie_embedding,
-            f.rating_raw,
-            s.dataset_split
-        FROM ({full_rows_query}) AS f
-        INNER JOIN split_index AS s
-          ON f.user_id = s.user_id
-         AND f.event_timestamp = s.event_timestamp
-    ),
-    with_jitter AS (
-        SELECT
-            user_id,
-            movie_id,
-            event_timestamp,
-            user_embedding,
-            movie_embedding,
-            rating_raw,
-            dataset_split,
-            LEAST(
-                5.0,
-                GREATEST(
-                    0.5,
-                    rating_raw + (
-                        (
-                            CAST(
-                                md5_number_lower(
-                                    CAST(user_id AS VARCHAR) || ':' || CAST(movie_id AS VARCHAR)
-                                ) AS DOUBLE
-                            ) / {UINT64_MAX}
-                        ) * {2.0 * jitter_amplitude} - {jitter_amplitude}
-                    )
+                fused = fuse_user_embedding(
+                    row.get("long_term_embedding"),
+                    row.get("short_term_embedding"),
+                    long_weight=long_weight,
+                    short_weight=short_weight,
                 )
-            ) AS rating_jittered
-        FROM joined_rows
-    )
-    SELECT
-        user_id,
-        movie_id,
-        event_timestamp,
-        user_embedding,
-        movie_embedding,
-        rating_raw,
-        rating_jittered,
-        1.0 / (
-            1.0 + EXP(
-                -{sigmoid_k} * (((rating_jittered - 0.5) / 4.5) - {sigmoid_c})
-            )
-        ) AS label,
-        dataset_split
-    FROM with_jitter
+
+                if fused is None:
+                    stats["dropped_missing_embedding_rows"] += 1
+                    continue
+
+                out_rows.append({
+                    "user_id": int(row["user_id"]),
+                    "user_embedding": fused,
+                    "profile_version": row.get("profile_version"),
+                })
+
+            writer.write_rows(out_rows)
+            stats["fused_user_rows_written"] += len(out_rows)
+    finally:
+        writer.close()
+
+    return stats
+
+
+# ============================================================
+# Step 2: Use DuckDB to build offline positive samples parquet
+# ============================================================
+def build_offline_positive_samples_parts_streaming(
+    remaining_user_events_path: str,
+    fused_user_embeddings_path: str,
+    movie_embedding_path: str,
+    local_tmp_dir: str,
+    output_parts_prefix: str,
+    scan_batch_rows: int = 2000,
+) -> Dict[str, Any]:
     """
+    Stream remaining_user_events in small Arrow batches.
+    For each batch:
+      - register the batch as a DuckDB temp view
+      - join with local fused_user_embeddings + movie_embeddings parquet
+      - write one small parquet part
+      - upload to S3/MinIO
+      - delete local part immediately
+    """
+    ensure_dir(local_tmp_dir)
 
+    event_dataset = ds.dataset(remaining_user_events_path, format="parquet")
+    scanner = event_dataset.scanner(
+        batch_size=scan_batch_rows,
+        columns=[
+            "user_id",
+            "movie_id",
+            "timestamp",
+            "event_time",
+            "future_event_order",
+            "rating",
+        ],
+    )
+
+    total_rows = 0
+    num_parts = 0
+    part_uris: List[str] = []
+
+    con = duckdb.connect(database=":memory:")
+    try:
+        con.execute("SET memory_limit='3GB'")
+
+        for batch_idx, event_batch in enumerate(scanner.to_batches()):
+            if event_batch.num_rows == 0:
+                continue
+
+            event_table = pa.Table.from_batches([event_batch])
+            con.register("event_batch", event_table)
+
+            joined = con.execute(
+                f"""
+                SELECT
+                    r.user_id AS user_id,
+                    r.movie_id AS movie_id,
+                    r.timestamp AS timestamp,
+                    r.event_time AS event_time,
+                    CAST(r.future_event_order AS INTEGER) AS future_event_order,
+                    CAST(r.rating AS DOUBLE) AS label,
+                    u.user_embedding AS user_embedding,
+                    m.embedding AS movie_embedding,
+                    u.profile_version AS profile_version
+                FROM event_batch r
+                INNER JOIN read_parquet('{fused_user_embeddings_path}') u
+                    ON r.user_id = u.user_id
+                INNER JOIN read_parquet('{movie_embedding_path}') m
+                    ON r.movie_id = m.movieId
+                """
+            ).fetch_arrow_table()
+
+            con.unregister("event_batch")
+
+            if joined.num_rows == 0:
+                continue
+
+            local_part_path = os.path.join(
+                local_tmp_dir,
+                f"offline_positive_samples_part_{batch_idx:05d}.parquet",
+            )
+
+            pq.write_table(
+                joined,
+                local_part_path,
+                compression="zstd",
+            )
+
+            target_path = f"{output_parts_prefix}/part_{batch_idx:05d}.parquet"
+            part_uri = upload_file_to_s3(local_part_path, target_path)
+
+            os.remove(local_part_path)
+
+            total_rows += joined.num_rows
+            num_parts += 1
+            part_uris.append(part_uri)
+
+            print(
+                f"[stream] uploaded part {batch_idx:05d}, "
+                f"input_rows={event_table.num_rows}, output_rows={joined.num_rows}"
+            )
+
+        return {
+            "offline_positive_samples_rows": total_rows,
+            "num_parts": num_parts,
+            "part_uris": part_uris,
+        }
+    finally:
+        con.close()
 
 # ============================================================
-# Split + write
+# Step 3: Append parquet to Iceberg
 # ============================================================
-def build_split_dataset(
-    con: duckdb.DuckDBPyConnection,
-    input_source: str,
-    input_kind: str,
-    output_dir: str,
-    split_strategy: str = "per_user_ratio",
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.1,
-    test_ratio: float = 0.2,
-    keep_rating_columns: bool = True,
-    sigmoid_k: float = DEFAULT_SIGMOID_K,
-    sigmoid_c: float = DEFAULT_SIGMOID_C,
-    jitter_amplitude: float = DEFAULT_JITTER_AMPLITUDE,
-    rating_col: str = "rating",
-    user_id_col: str = "user_id",
-    movie_id_col: str = "movie_id",
-    timestamp_col: str = "timestamp",
-    user_embedding_col: str = "user_embedding",
-    movie_embedding_col: str = "movie_embedding",
-    union_by_name: bool = True,
-    per_thread_output: bool = False,
-    write_partitioned_output: bool = False,
-) -> Dict[str, int]:
-    if not is_s3_path(output_dir):
-        ensure_dir(output_dir)
+def ensure_namespace(catalog, namespace: str) -> None:
+    existing = catalog.list_namespaces()
+    normalized = set()
+    for ns in existing:
+        if isinstance(ns, tuple):
+            normalized.add(".".join(ns))
+            if len(ns) == 1:
+                normalized.add(ns[0])
+        else:
+            normalized.add(ns)
 
-    train_path = os.path.join(output_dir, "train.parquet")
-    val_path = os.path.join(output_dir, "val.parquet")
-    test_path = os.path.join(output_dir, "test.parquet")
+    if namespace not in normalized:
+        catalog.create_namespace(namespace)
 
-    total_ratio = train_ratio + val_ratio + test_ratio
-    if abs(total_ratio - 1.0) > 1e-8:
-        raise ValueError(
-            f"train_ratio + val_ratio + test_ratio must equal 1.0, got {total_ratio}"
-        )
-    if split_strategy != "per_user_ratio":
-        raise ValueError(f"Unsupported split strategy: {split_strategy}")
 
-    source_expr = parquet_read_expr(input_source, input_kind, union_by_name=union_by_name)
+def ensure_table(catalog, identifier: str, schema: Schema) -> None:
+    namespace, table_name = identifier.split(".", 1)
+    ensure_namespace(catalog, namespace)
 
-    split_index_query = build_split_index_query(
-        source_expr=source_expr,
-        user_id_col=user_id_col,
-        movie_id_col=movie_id_col,
-        timestamp_col=timestamp_col,
-        train_ratio=train_ratio,
-        val_ratio=val_ratio,
-    )
-    full_rows_query = build_full_rows_query(
-        source_expr=source_expr,
-        rating_col=rating_col,
-        user_id_col=user_id_col,
-        movie_id_col=movie_id_col,
-        timestamp_col=timestamp_col,
-        user_embedding_col=user_embedding_col,
-        movie_embedding_col=movie_embedding_col,
-    )
-    labeled_joined_query = build_labeled_joined_query(
-        full_rows_query=full_rows_query,
-        sigmoid_k=sigmoid_k,
-        sigmoid_c=sigmoid_c,
-        jitter_amplitude=jitter_amplitude,
+    existing_tables = catalog.list_tables(namespace)
+    normalized = set()
+    for t in existing_tables:
+        if isinstance(t, tuple):
+            normalized.add(".".join(t))
+            if len(t) == 2:
+                normalized.add(f"{t[0]}.{t[1]}")
+                normalized.add(t[1])
+        else:
+            normalized.add(t)
+
+    if identifier not in normalized and table_name not in normalized:
+        catalog.create_table(identifier, schema=schema)
+
+
+def append_parquet_to_iceberg(
+    catalog_name: str,
+    table_identifier: str,
+    parquet_path: str,
+    batch_rows: int,
+    cfg: Dict[str, Any],
+) -> None:
+    iceberg_uri = deep_get(cfg, ["iceberg", "uri"])
+    iceberg_warehouse = deep_get(cfg, ["iceberg", "warehouse"])
+
+    if not iceberg_uri:
+        raise ValueError("Missing config: iceberg.uri")
+    if not iceberg_warehouse:
+        raise ValueError("Missing config: iceberg.warehouse")
+
+    access_key = (
+    os.getenv("MINIO_ACCESS_KEY")
+    or os.getenv("AWS_ACCESS_KEY_ID")
+    or os.getenv("MINIO_ROOT_USER")
+)
+    secret_key = (
+        os.getenv("MINIO_SECRET_KEY")
+        or os.getenv("AWS_SECRET_ACCESS_KEY")
+        or os.getenv("MINIO_ROOT_PASSWORD")
     )
 
-    # Lightweight split index first: only user_id / timestamp after dropping ambiguous keys.
-    con.execute(f"CREATE OR REPLACE TEMP TABLE split_index AS {split_index_query}")
+    catalog = load_catalog(
+        catalog_name,
+        uri=iceberg_uri,
+        warehouse=iceberg_warehouse,
+        **{
+        "s3.endpoint": "http://minio:9000",
+        "s3.path-style-access": "true",
+        "s3.access-key-id": access_key,
+        "s3.secret-access-key": secret_key,
+        "s3.region": "eu-central-1",
+    },
+    )
 
-    # Join back to full rows on (user_id, timestamp), then compute label.
-    con.execute(f"CREATE OR REPLACE TEMP TABLE split_data AS {labeled_joined_query}")
+    ensure_table(
+        catalog=catalog,
+        identifier=table_identifier,
+        schema=offline_positive_samples_iceberg_schema(),
+    )
 
-    extra_cols = ", rating_raw, rating_jittered" if keep_rating_columns else ""
-    per_thread_clause = ", PER_THREAD_OUTPUT TRUE" if per_thread_output else ""
+    table = catalog.load_table(table_identifier)
+    parquet_file = pq.ParquetFile(parquet_path)
 
-    def copy_one(split_name: str, path: str) -> None:
-        con.execute(f"""
-            COPY (
-                SELECT
-                    user_id,
-                    movie_id,
-                    user_embedding,
-                    movie_embedding
-                    {extra_cols},
-                    label
-                FROM split_data
-                WHERE dataset_split = {sql_quote(split_name)}
-                ORDER BY user_id, event_timestamp, movie_id
-            )
-            TO {sql_quote(path)}
-            (FORMAT PARQUET, COMPRESSION ZSTD{per_thread_clause})
-        """)
-
-    if write_partitioned_output:
-        partitioned_root = output_dir.rstrip("/")
-        con.execute(f"""
-            COPY (
-                SELECT
-                    user_id,
-                    movie_id,
-                    user_embedding,
-                    movie_embedding
-                    {extra_cols},
-                    label,
-                    dataset_split
-                FROM split_data
-                ORDER BY dataset_split, user_id, event_timestamp, movie_id
-            )
-            TO {sql_quote(partitioned_root)}
-            (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (dataset_split){per_thread_clause})
-        """)
-    else:
-        copy_one("train", train_path)
-        copy_one("val", val_path)
-        copy_one("test", test_path)
-
-    stats_row = con.execute(
-        """
-        WITH raw_stats AS (
-            SELECT
-                COUNT(*) AS raw_rows,
-                SUM(CASE WHEN key_dup_cnt > 1 THEN 1 ELSE 0 END) AS ambiguous_rows
-            FROM (
-                SELECT
-                    COUNT(*) OVER (PARTITION BY user_id, event_timestamp) AS key_dup_cnt
-                FROM (
-                    SELECT
-                        CAST(user_id AS VARCHAR) AS user_id,
-                        CAST(event_timestamp AS VARCHAR) AS event_timestamp
-                    FROM (
-                        SELECT
-                            {user_id_col} AS user_id,
-                            {timestamp_col} AS event_timestamp
-                        FROM {source_expr}
-                    )
-                )
-            )
-        )
-        SELECT
-            (SELECT raw_rows FROM raw_stats) AS raw_rows,
-            (SELECT ambiguous_rows FROM raw_stats) AS ambiguous_rows,
-            (SELECT COUNT(*) FROM split_index) AS split_index_rows,
-            SUM(CASE WHEN dataset_split = 'train' THEN 1 ELSE 0 END) AS train_rows,
-            SUM(CASE WHEN dataset_split = 'val' THEN 1 ELSE 0 END) AS val_rows,
-            SUM(CASE WHEN dataset_split = 'test' THEN 1 ELSE 0 END) AS test_rows,
-            COUNT(*) AS total_rows
-        FROM split_data
-        """.format(
-            user_id_col=user_id_col,
-            timestamp_col=timestamp_col,
-            source_expr=source_expr,
-        )
-    ).fetchone()
-
-    raw_rows = int(stats_row[0])
-    ambiguous_rows = int(stats_row[1])
-    split_index_rows = int(stats_row[2])
-    train_rows = int(stats_row[3])
-    val_rows = int(stats_row[4])
-    test_rows = int(stats_row[5])
-    total_rows = int(stats_row[6])
-
-    return {
-        "raw_rows": raw_rows,
-        "ambiguous_rows_dropped": ambiguous_rows,
-        "split_index_rows": split_index_rows,
-        "train_rows": train_rows,
-        "val_rows": val_rows,
-        "test_rows": test_rows,
-        "total_rows": total_rows,
-    }
+    for batch in parquet_file.iter_batches(batch_size=batch_rows):
+        arrow_table = pa.Table.from_batches([batch])
+        table.append(arrow_table)
 
 
 # ============================================================
@@ -617,217 +867,187 @@ def build_split_dataset(
 # ============================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", required=True, help="Path to YAML config")
     args = parser.parse_args()
 
     cfg = load_yaml_config(args.config)
 
-    job_name = deep_get(cfg, ["job", "name"], "split_versioned_dataset_with_label_transform")
+    print("[preflight] validating config, storage, and parquet schema")
+    run_preflight_checks(cfg)
+    print("[preflight] ok")
+
+    job_name = deep_get(cfg, ["job", "name"], "build_offline_positive_samples")
     created_at = datetime.now(timezone.utc).isoformat()
 
-    dataset_type = deep_get(cfg, ["dataset", "type"], "offline")
-    if dataset_type not in {"offline", "online"}:
-        raise ValueError("dataset.type must be either 'offline' or 'online'")
+    base_user_profiles_path = deep_get(cfg, ["input", "base_user_profiles_path"])
+    remaining_user_events_path = deep_get(cfg, ["input", "remaining_user_events_path"])
+    movie_embedding_path = deep_get(cfg, ["input", "movie_embedding_path"])
 
-    input_override_source = deep_get(cfg, ["input", "source"])
-    input_override_kind = deep_get(cfg, ["input", "source_kind"])
+    long_weight = float(deep_get(cfg, ["user_embedding", "long_weight"], 0.4))
+    short_weight = float(deep_get(cfg, ["user_embedding", "short_weight"], 0.6))
 
-    if input_override_source:
-        require_value("input.source_kind", input_override_kind)
-        input_info = {
-            "source_registry": None,
-            "source_version": None,
-            "input_source": input_override_source,
-            "input_kind": input_override_kind,
-        }
-        source_root_dir = None
-    else:
-        if dataset_type == "offline":
-            source_root_dir = deep_get(cfg, ["input", "offline_root_dir"])
-        else:
-            source_root_dir = deep_get(cfg, ["input", "online_root_dir"])
-        require_value(f"input.{dataset_type}_root_dir", source_root_dir)
-        input_info = resolve_latest_input_source(source_root_dir)
+    profile_batch_size = int(deep_get(cfg, ["runtime", "profile_batch_size"], 5000))
+    iceberg_append_batch_rows = int(deep_get(cfg, ["runtime", "iceberg_append_batch_rows"], 50000))
+    local_tmp_dir = deep_get(cfg, ["runtime", "local_tmp_dir"], "/mnt/block/tmp")
+    iceberg_enabled = bool(deep_get(cfg, ["iceberg", "enabled"], False))
 
-    input_source = input_info["input_source"]
-    input_kind = input_info["input_kind"]
-    source_registry = input_info.get("source_registry")
-    source_version = input_info.get("source_version")
+    dataset_root = deep_get(
+        cfg,
+        ["output", "warehouse_dir"],
+        "s3://warehouse/datasets/offline-positive-samples",
+    )
+    write_parquet = bool(deep_get(cfg, ["output", "write_parquet"], True))
 
-    output_root = deep_get(cfg, ["output", "root_dir"], "/warehouse/dataset/versioned_dataset")
-    local_metadata_root = deep_get(cfg, ["output", "local_metadata_root"])
-
-    split_strategy = deep_get(cfg, ["split", "strategy"], "per_user_ratio")
-    train_ratio = float(deep_get(cfg, ["split", "train_ratio"], 0.7))
-    val_ratio = float(deep_get(cfg, ["split", "val_ratio"], 0.1))
-    test_ratio = float(deep_get(cfg, ["split", "test_ratio"], 0.2))
-
-    rating_col = deep_get(cfg, ["columns", "rating"], "rating")
-    user_id_col = deep_get(cfg, ["columns", "user_id"], "user_id")
-    movie_id_col = deep_get(cfg, ["columns", "movie_id"], "movie_id")
-    timestamp_col = deep_get(cfg, ["columns", "timestamp"], "timestamp")
-    user_embedding_col = deep_get(cfg, ["columns", "user_embedding"], "user_embedding")
-    movie_embedding_col = deep_get(cfg, ["columns", "movie_embedding"], "movie_embedding")
-
-    sigmoid_k = float(deep_get(cfg, ["label_transform", "sigmoid_k"], DEFAULT_SIGMOID_K))
-    sigmoid_c = float(deep_get(cfg, ["label_transform", "sigmoid_c"], DEFAULT_SIGMOID_C))
-    jitter_amplitude = float(deep_get(cfg, ["label_transform", "jitter_amplitude"], DEFAULT_JITTER_AMPLITUDE))
-    keep_rating_columns = bool(deep_get(cfg, ["label_transform", "keep_rating_columns"], True))
-
-    union_by_name = bool(deep_get(cfg, ["read", "union_by_name"], True))
-    per_thread_output = bool(deep_get(cfg, ["write", "per_thread_output"], False))
-    write_partitioned_output = bool(deep_get(cfg, ["write", "write_partitioned_output"], False))
-
-    if is_s3_path(output_root) and not local_metadata_root:
-        raise ValueError(
-            "When output.root_dir is on S3, output.local_metadata_root must be a local path for registry/manifest bookkeeping."
-        )
-
-    dataset_root = os.path.join(output_root, dataset_type)
-    versions_dir = os.path.join(dataset_root, "versions")
-    latest_dir = os.path.join(dataset_root, "latest")
-
-    metadata_dataset_root = dataset_root if not local_metadata_root else os.path.join(local_metadata_root, dataset_type)
-    registry_path = os.path.join(metadata_dataset_root, "registry", "versions.json")
-
-    if not is_s3_path(versions_dir):
-        ensure_dir(versions_dir)
-        ensure_dir(latest_dir)
-    ensure_dir(os.path.dirname(registry_path))
+    latest_dir = f"{dataset_root}/latest"
+    versions_dir = f"{dataset_root}/versions"
+    registry_path = f"{dataset_root}/registry/version.json"
 
     registry = get_registry_json(registry_path)
-    version_name = next_version_name(registry.get("versions", []))
-    version_dir = os.path.join(versions_dir, version_name)
+    version_name = next_version_name(
+        registry.get("versions", []),
+        registry.get("latest"),
+    )
+    version_dir = f"{versions_dir}/{version_name}"
+    parts_prefix = f"{version_dir}/parts"
 
-    duckdb_path = deep_get(cfg, ["runtime", "duckdb_path"], ":memory:")
-    if duckdb_path != ":memory:":
-        ensure_dir(os.path.dirname(duckdb_path))
+    latest_data_path = f"{latest_dir}/data.parquet"
+    latest_manifest_path = f"{latest_dir}/manifest.json"
+    version_manifest_path = f"{version_dir}/manifest.json"
 
-    con = duckdb.connect(database=duckdb_path)
+    ensure_output_dir(version_dir)
+    ensure_output_dir(parts_prefix)
+    ensure_output_dir(latest_dir)
+
+    print(
+        f"[{job_name}] resolved version: latest={registry.get('latest')} -> next={version_name}, "
+        f"output_dir={version_dir}"
+    )
+
+    catalog_name = deep_get(cfg, ["iceberg", "catalog_name"], "default")
+    namespace = deep_get(cfg, ["iceberg", "namespace"], "recsys")
+    table_name = deep_get(cfg, ["iceberg", "table_name"], "offline_positive_samples")
+    table_identifier = f"{namespace}.{table_name}"
+
+    os.makedirs(local_tmp_dir, exist_ok=True)
+    runtime_dir = tempfile.mkdtemp(prefix="offline_samples_", dir=local_tmp_dir)
+
     try:
-        configure_duckdb_runtime(con, cfg)
+        local_inputs_dir = os.path.join(runtime_dir, "inputs")
+        local_staging_dir = os.path.join(runtime_dir, "staging")
+        reset_dir(local_staging_dir)
 
-        stats = build_split_dataset(
-            con=con,
-            input_source=input_source,
-            input_kind=input_kind,
-            output_dir=version_dir,
-            split_strategy=split_strategy,
-            train_ratio=train_ratio,
-            val_ratio=val_ratio,
-            test_ratio=test_ratio,
-            keep_rating_columns=keep_rating_columns,
-            sigmoid_k=sigmoid_k,
-            sigmoid_c=sigmoid_c,
-            jitter_amplitude=jitter_amplitude,
-            rating_col=rating_col,
-            user_id_col=user_id_col,
-            movie_id_col=movie_id_col,
-            timestamp_col=timestamp_col,
-            user_embedding_col=user_embedding_col,
-            movie_embedding_col=movie_embedding_col,
-            union_by_name=union_by_name,
-            per_thread_output=per_thread_output,
-            write_partitioned_output=write_partitioned_output,
+        local_base_user_profiles_path = materialize_input_to_local(
+            base_user_profiles_path,
+            os.path.join(local_inputs_dir, "base_user_profiles.parquet"),
         )
+        local_remaining_user_events_path = materialize_input_to_local(
+            remaining_user_events_path,
+            os.path.join(local_inputs_dir, "remaining_user_events.parquet"),
+        )
+        local_movie_embedding_path = materialize_input_to_local(
+            movie_embedding_path,
+            os.path.join(local_inputs_dir, "movie_embeddings.parquet"),
+        )
+
+        fused_user_embeddings_path = os.path.join(local_staging_dir, "fused_user_embeddings.parquet")
+        # offline_positive_samples_path = os.path.join(local_staging_dir, "offline_positive_samples.parquet")
+
+        print(f"[{job_name}] step1: build fused user embeddings")
+        fuse_stats = build_fused_user_embeddings(
+            base_user_profiles_path=local_base_user_profiles_path,
+            fused_user_embeddings_path=fused_user_embeddings_path,
+            batch_size=profile_batch_size,
+            long_weight=long_weight,
+            short_weight=short_weight,
+        )
+
+        stream_batch_rows = int(deep_get(cfg, ["runtime", "profile_batch_size"], 2000))
+
+        print(f"[{job_name}] step2: build offline positive samples parquet parts")
+        sample_stats = build_offline_positive_samples_parts_streaming(
+            remaining_user_events_path=local_remaining_user_events_path,
+            fused_user_embeddings_path=fused_user_embeddings_path,
+            movie_embedding_path=local_movie_embedding_path,
+            local_tmp_dir=local_staging_dir,
+            output_parts_prefix=parts_prefix,
+            scan_batch_rows=stream_batch_rows,
+        )
+
+        if iceberg_enabled:
+            print(f"[{job_name}] step3: append to Iceberg {table_identifier}")
+            try:
+                append_parquet_to_iceberg(
+                    catalog_name=catalog_name,
+                    table_identifier=table_identifier,
+                    parquet_path=offline_positive_samples_path,
+                    batch_rows=iceberg_append_batch_rows,
+                    cfg=cfg,
+                )
+            except Exception as e:
+                iceberg_error = str(e)
+                print(f"[{job_name}] error appending to Iceberg: {iceberg_error}")
+                iceberg_enabled = False
+        else:
+                print(f"[{job_name}] iceberg append skipped (disabled in config)")
+
+        manifest = {
+            "job_name": job_name,
+            "created_at": created_at,
+            "version": version_name,
+            "input": {
+                "base_user_profiles_path": resolve_input_path(base_user_profiles_path),
+                "remaining_user_events_path": resolve_input_path(remaining_user_events_path),
+                "movie_embedding_path": resolve_input_path(movie_embedding_path),
+            },
+            "user_embedding": {
+                "long_weight": long_weight,
+                "short_weight": short_weight,
+                "fallback_rule": "0.4*long+0.6*short; short_only_if_no_long; long_only_if_no_short; drop_if_both_missing",
+            },
+            "output": {
+                "data_parts_prefix": parts_prefix,
+                "num_parts": sample_stats["num_parts"],
+                "version_dir": version_dir,
+                "latest_dir": latest_dir,
+            },
+            "iceberg": {
+                "enabled" : iceberg_enabled,
+                "catalog_name": catalog_name,
+                "namespace": namespace,
+                "table_name": table_name,
+                "table_identifier": table_identifier,
+            },
+            "stats": {
+                **fuse_stats,
+                **sample_stats,
+            },
+        }
+
+        manifest_payload = json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8")
+        version_manifest_uri = upload_bytes_to_s3(manifest_payload, version_manifest_path)
+        latest_manifest_uri = upload_bytes_to_s3(manifest_payload, latest_manifest_path)
+
+        row_count = int(sample_stats.get("offline_positive_samples_rows", 0))
+        registry_entry = {
+            "version": version_name,
+            "created_at": created_at,
+            "data_parts_prefix": parts_prefix,
+            "manifest": version_manifest_uri,
+            "row_count": row_count,
+        }
+        registry["versions"] = registry.get("versions", [])
+        registry["versions"].append(registry_entry)
+        registry["latest"] = version_name
+        save_registry_json(registry_path, registry)
+
+        print(f"[{job_name}] done")
+        print(f"[{job_name}] uploaded parts prefix: {parts_prefix}")
+        print(f"[{job_name}] uploaded manifest: {version_manifest_uri}")
+        print(f"[{job_name}] uploaded latest/manifest: {latest_manifest_uri}")
+        print(f"[{job_name}] updated registry: {registry_path}")
+        print(json.dumps(manifest["stats"], indent=2, ensure_ascii=False))
     finally:
-        con.close()
-
-    if not write_partitioned_output:
-        latest_train = os.path.join(latest_dir, "train.parquet")
-        latest_val = os.path.join(latest_dir, "val.parquet")
-        latest_test = os.path.join(latest_dir, "test.parquet")
-
-        if not any(is_s3_path(p) for p in [version_dir, latest_dir]):
-            ensure_dir(latest_dir)
-            for src, dst in [
-                (os.path.join(version_dir, "train.parquet"), latest_train),
-                (os.path.join(version_dir, "val.parquet"), latest_val),
-                (os.path.join(version_dir, "test.parquet"), latest_test),
-            ]:
-                if os.path.exists(dst):
-                    os.remove(dst)
-                shutil.copyfile(src, dst)
-
-    manifest = {
-        "job_name": job_name,
-        "created_at": created_at,
-        "dataset_type": dataset_type,
-        "version": version_name,
-        "input": {
-            "source_root_dir": source_root_dir,
-            "source_registry": source_registry,
-            "source_version": source_version,
-            "input_source": input_source,
-            "input_kind": input_kind,
-        },
-        "split": {
-            "strategy": split_strategy,
-            "lightweight_split_key": [user_id_col, timestamp_col],
-            "ambiguous_key_policy": "drop rows where (user_id, timestamp) is not unique before split and before join-back",
-            "train_ratio": train_ratio,
-            "val_ratio": val_ratio,
-            "test_ratio": test_ratio,
-        },
-        "label_transform": {
-            "deterministic_jitter_key": [user_id_col, movie_id_col],
-            "jitter_method": "md5_number_lower(user_id || ':' || movie_id)",
-            "jitter_amplitude": jitter_amplitude,
-            "rating_clip_range": [0.5, 5.0],
-            "normalize_formula": "(rating_jittered - 0.5) / 4.5",
-            "sigmoid_k": sigmoid_k,
-            "sigmoid_c": sigmoid_c,
-            "transform_stage": "after split-index join-back",
-        },
-        "output": {
-            "root_dir": output_root,
-            "dataset_root": dataset_root,
-            "version_dir": version_dir,
-            "latest_dir": latest_dir,
-            "partitioned_output": write_partitioned_output,
-            "train_parquet": None if write_partitioned_output else os.path.join(version_dir, "train.parquet"),
-            "val_parquet": None if write_partitioned_output else os.path.join(version_dir, "val.parquet"),
-            "test_parquet": None if write_partitioned_output else os.path.join(version_dir, "test.parquet"),
-            "local_metadata_root": local_metadata_root,
-        },
-        "schema_note": {
-            "index_fields": ["user_id", "movie_id"],
-            "auxiliary_fields": ["rating_raw", "rating_jittered"] if keep_rating_columns else [],
-            "training_core_fields": ["user_embedding", "movie_embedding", "label"],
-        },
-        "stats": stats,
-    }
-
-    version_metadata_dir = os.path.join(metadata_dataset_root, "versions", version_name)
-    latest_metadata_dir = os.path.join(metadata_dataset_root, "latest")
-    ensure_dir(version_metadata_dir)
-    ensure_dir(latest_metadata_dir)
-
-    manifest_path = os.path.join(version_metadata_dir, "manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-    latest_manifest_path = os.path.join(latest_metadata_dir, "manifest.json")
-    with open(latest_manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-
-    registry_entry = {
-        "version": version_name,
-        "created_at": created_at,
-        "dataset_type": dataset_type,
-        "source_version": source_version,
-        "data_parts_prefix": None if write_partitioned_output else None,  # Not using parts prefix in this implementation
-        "manifest": manifest_path,
-        "row_count": stats["total_rows"],
-    }
-
-    registry["versions"] = registry.get("versions", [])
-    registry["versions"].append(registry_entry)
-    registry["latest"] = version_name
-    save_registry_json(registry_path, registry)
-
-    print(f"[{job_name}] done")
-    print(json.dumps(manifest["stats"], indent=2, ensure_ascii=False))
+        shutil.rmtree(runtime_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
