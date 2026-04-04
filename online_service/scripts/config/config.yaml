@@ -1,0 +1,50 @@
+postgres:
+  host: postgres
+  port: 5432
+  dbname: recsys
+  user: recsys
+  password: recsys123
+  connect_timeout_seconds: 5
+
+object_storage:
+  endpoint: http://minio:9000
+  bucket: artifacts
+  access_key: minioadmin
+  secret_key: minioadmin123
+
+processor_intervals:
+  auth_processor_seconds: 200
+  event_processor_seconds: 200
+  popular_movie_updater_seconds: 300
+  user_embedding_updater_seconds: 800
+  exporter_seconds: 40
+
+embedding:
+  recent_events_limit: 200
+  min_watch_duration_seconds: 30.0
+  version_prefix: "user-embedding"
+  snapshot_root: s3://artifacts/online-service-user-embeddings
+
+candidate:
+  top_k_default: 10
+  popular_fallback_k: 20
+  movie_embeddings_npy_path: /data/embedding/embedding.npy
+  movie_embedding_index_path: /data/embedding/faiss.index
+  movie_ids_path: /data/embedding/movie_ids.npy
+  hnsw_m: 32
+  hnsw_ef_search: 64
+
+user_history_query:
+  recent_limit: 200
+  recent_window_hours: 720
+
+exporter:
+  snapshot_root: s3://artifacts/online-service-export
+  auth_events_prefix: auth_events
+  user_events_prefix: user_events
+  write_parquet: true
+
+api:
+  enabled: true
+  host: 0.0.0.0
+  port: 18080
