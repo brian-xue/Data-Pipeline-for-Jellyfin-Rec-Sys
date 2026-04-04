@@ -38,11 +38,25 @@ class SimulatorConfig:
 
 
 @dataclass(frozen=True)
+class IngestApiConfig:
+    enabled: bool
+    endpoint: str
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
 class AppConfig:
     postgres: PostgresConfig
     simulator: SimulatorConfig
     random_seed: int = 42
     incremental_request: dict = field(default_factory=dict)
+    ingest_api: IngestApiConfig = field(
+        default_factory=lambda: IngestApiConfig(
+            enabled=False,
+            endpoint="http://api:8080/ingest/events",
+            timeout_seconds=5.0,
+        )
+    )
 
 
 def _deep_get(data: dict[str, Any], keys: list[str], default: Any = None) -> Any:
@@ -92,4 +106,15 @@ def load_config(path: str) -> AppConfig:
 
     random_seed = int(_deep_get(raw, ["random_seed"], 42))
     incremental_request = raw.get("incremental_request", {})
-    return AppConfig(postgres=postgres, simulator=simulator, random_seed=random_seed, incremental_request=incremental_request)
+    ingest_api = IngestApiConfig(
+        enabled=bool(_deep_get(raw, ["ingest_api", "enabled"], False)),
+        endpoint=str(_deep_get(raw, ["ingest_api", "endpoint"], "http://api:8080/ingest/events")),
+        timeout_seconds=float(_deep_get(raw, ["ingest_api", "timeout_seconds"], 5.0)),
+    )
+    return AppConfig(
+        postgres=postgres,
+        simulator=simulator,
+        random_seed=random_seed,
+        incremental_request=incremental_request,
+        ingest_api=ingest_api,
+    )

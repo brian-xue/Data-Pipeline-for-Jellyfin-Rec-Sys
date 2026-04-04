@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 
+from api_writer import ApiEventWriter
 from config import AppConfig
 from db.client import create_session_factory
 from db.writer import EventWriter
@@ -23,9 +24,7 @@ def run_simulation(cfg: AppConfig) -> None:
 		random_seed=cfg.random_seed,
 	)
 
-	session_factory = create_session_factory(cfg.postgres)
-	with session_factory() as db_session:
-		writer = EventWriter(db_session)
+	def _run_with_writer(writer: EventWriter | ApiEventWriter) -> None:
 		state = SimulatorState(
 			online_users=set(),
 			offline_users=set(user_pool),
@@ -34,7 +33,6 @@ def run_simulation(cfg: AppConfig) -> None:
 		service = SimulatorService(cfg=cfg.simulator, state=state, writer=writer)
 		scheduler = TickScheduler(cfg.simulator.tick_seconds)
 
-		# Start incremental candidate request if enabled
 		inc_cfg = cfg.incremental_request or {}
 		if inc_cfg.get("enabled", False):
 			import threading
@@ -71,4 +69,18 @@ def run_simulation(cfg: AppConfig) -> None:
 			if forced_logout_count > 0:
 				writer.commit()
 				print(f"Flushed {forced_logout_count} active users with logout events.")
+
+	if cfg.ingest_api.enabled:
+		print(f"Using API ingest writer: {cfg.ingest_api.endpoint}")
+		writer = ApiEventWriter(
+			endpoint=cfg.ingest_api.endpoint,
+			timeout_seconds=cfg.ingest_api.timeout_seconds,
+		)
+		_run_with_writer(writer)
+		return
+
+	session_factory = create_session_factory(cfg.postgres)
+	with session_factory() as db_session:
+		writer = EventWriter(db_session)
+		_run_with_writer(writer)
 
