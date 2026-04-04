@@ -1,0 +1,28 @@
+job:
+  name: build_online_positive_samples
+
+input:
+  s3://artifacts/online-service-export/
+
+embedding_path:
+  s3://artifacts/online-service-user-embeddings/
+
+movie_embedding_path:
+  s3://embedding/movie_embeddings.parquet
+
+user_embedding:
+
+runtime:
+  profile_batch_size: 100000
+
+output:
+  warehouse_dir: s3://warehouse/dataset/online_positive_samples
+  write_parquet: true
+
+
+environment:
+  POSTGRES_HOST: postgres
+  MINIO_ENDPOINT: http://minio:9000
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin123
+  AWS_REGION: eu-central-1

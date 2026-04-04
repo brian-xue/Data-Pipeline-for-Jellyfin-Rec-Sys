@@ -19,16 +19,16 @@ output:
   warehouse_dir: s3://warehouse/dataset/offline_positive_samples
   write_parquet: true
 
-iceberg:
-  enabled: false
-  catalog_name: default
-  namespace: recsys
-  table_name: offline_positive_samples
-  uri: sqlite:////data/warehouse/dataset/offline_iceberg_catalog.db
-  s3_endpoint: http://minio:9000
-  s3_access_key: minioadmin
-  s3_secret_key: minioadmin123
-  warehouse: s3://warehouse
+# iceberg:
+#   enabled: false
+#   catalog_name: default
+#   namespace: recsys
+#   table_name: offline_positive_samples
+#   uri: sqlite:////data/warehouse/dataset/offline_iceberg_catalog.db
+#   s3_endpoint: http://minio:9000
+#   s3_access_key: minioadmin
+#   s3_secret_key: minioadmin123
+#   warehouse: s3://warehouse
 
 environment:
   POSTGRES_HOST: postgres

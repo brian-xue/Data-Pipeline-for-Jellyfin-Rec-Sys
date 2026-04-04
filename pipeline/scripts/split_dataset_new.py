@@ -488,6 +488,8 @@ def transform_batch_offline(
     table: pa.Table,
     user_id_col: str,
     movie_id_col: str,
+    user_embedding_col: str,
+    movie_embedding_col: str,
     label_col: str,
     sigmoid_k: float,
     sigmoid_c: float,
@@ -515,18 +517,23 @@ def transform_batch_offline(
         label_jittered.append(rj)
         label_final.append(y)
 
-    out = table
-    if keep_source_label and label_col in out.column_names:
-        out = out.rename_columns([("label_source" if c == label_col else c) for c in out.column_names])
-
-    out = out.append_column("label_raw", pa.array(label_raw, type=pa.float64()))
-    out = out.append_column("label_jittered", pa.array(label_jittered, type=pa.float64()))
-    out = out.append_column("label", pa.array(label_final, type=pa.float64()))
-    return out
+    return pa.table(
+        {
+            "user_id": pa.array(user_ids),
+            "movie_id": pa.array(movie_ids),
+            "user_embedding": table[user_embedding_col],
+            "movie_embedding": table[movie_embedding_col],
+            "label": pa.array(label_final, type=pa.float64()),
+        }
+    )
 
 
 def transform_batch_online(
     table: pa.Table,
+    user_id_col: str,
+    movie_id_col: str,
+    user_embedding_col: str,
+    movie_embedding_col: str,
     label_col: str,
     play_time_cap: float,
     keep_source_label: bool = True,
@@ -547,14 +554,16 @@ def transform_batch_online(
         play_time_capped.append(c)
         label_final.append(y)
 
-    out = table
-    if keep_source_label and label_col in out.column_names:
-        out = out.rename_columns([("label_source" if c == label_col else c) for c in out.column_names])
-
-    out = out.append_column("play_time_raw", pa.array(play_time_raw, type=pa.float64()))
-    out = out.append_column("play_time_capped", pa.array(play_time_capped, type=pa.float64()))
-    out = out.append_column("label", pa.array(label_final, type=pa.float64()))
-    return out
+    pyd = table.to_pydict()
+    return pa.table(
+        {
+            "user_id": pa.array(pyd[user_id_col]),
+            "movie_id": pa.array(pyd[movie_id_col]),
+            "user_embedding": table[user_embedding_col],
+            "movie_embedding": table[movie_embedding_col],
+            "label": pa.array(label_final, type=pa.float64()),
+        }
+    )
 
 
 # ============================================================
@@ -617,7 +626,6 @@ def build_split_dataset(
     label_col: str = "label",
     user_id_col: str = "user_id",
     movie_id_col: str = "movie_id",
-    timestamp_col: str = "timestamp",
     user_embedding_col: str = "user_embedding",
     movie_embedding_col: str = "movie_embedding",
     offline_sigmoid_k: float = DEFAULT_OFFLINE_SIGMOID_K,
@@ -648,7 +656,6 @@ def build_split_dataset(
     required_cols = {
         user_id_col,
         movie_id_col,
-        timestamp_col,
         user_embedding_col,
         movie_embedding_col,
         label_col,
@@ -724,7 +731,6 @@ def build_split_dataset(
         columns=[
             user_id_col,
             movie_id_col,
-            timestamp_col,
             user_embedding_col,
             movie_embedding_col,
             label_col,
@@ -825,6 +831,8 @@ def build_split_dataset(
                 table=table,
                 user_id_col=user_id_col,
                 movie_id_col=movie_id_col,
+                user_embedding_col=user_embedding_col,
+                movie_embedding_col=movie_embedding_col,
                 label_col=label_col,
                 sigmoid_k=offline_sigmoid_k,
                 sigmoid_c=offline_sigmoid_c,
@@ -834,6 +842,10 @@ def build_split_dataset(
         elif dataset_type == "online":
             table = transform_batch_online(
                 table=table,
+                user_id_col=user_id_col,
+                movie_id_col=movie_id_col,
+                user_embedding_col=user_embedding_col,
+                movie_embedding_col=movie_embedding_col,
                 label_col=label_col,
                 play_time_cap=online_play_time_cap,
                 keep_source_label=keep_source_label,
@@ -1291,7 +1303,6 @@ def main():
     label_col = columns_cfg.get("label", "label")
     user_id_col = columns_cfg.get("user_id", "user_id")
     movie_id_col = columns_cfg.get("movie_id", "movie_id")
-    timestamp_col = columns_cfg.get("timestamp", "timestamp")
     user_embedding_col = columns_cfg.get("user_embedding", "user_embedding")
     movie_embedding_col = columns_cfg.get("movie_embedding", "movie_embedding")
 
@@ -1367,7 +1378,6 @@ def main():
         label_col=label_col,
         user_id_col=user_id_col,
         movie_id_col=movie_id_col,
-        timestamp_col=timestamp_col,
         user_embedding_col=user_embedding_col,
         movie_embedding_col=movie_embedding_col,
         offline_sigmoid_k=offline_k,
