@@ -120,8 +120,9 @@ services:
         condition: service_healthy
     volumes:
       - /mnt/block/artifacts:/data/artifacts:ro # Read-only model access
+      - /mnt/block/embedding:/data/embedding
       - ./online_service:/app
-    command: tail -f /dev/null 
+    command: gunicorn -w 2 -b 0.0.0.0:18080 "scripts.api.candidate_api:create_app()"
     environment:
       POSTGRES_HOST: postgres
       MINIO_ENDPOINT: http://minio:9000
@@ -138,6 +139,7 @@ services:
     #   api:
     #     condition: service_healthy
     restart: unless-stopped
+    command: tail -f /dev/null
     volumes:
       - ./simulator:/app
     environment:

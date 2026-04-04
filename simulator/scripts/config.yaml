@@ -1,0 +1,43 @@
+postgres:
+  host: postgres
+  port: 5432
+  dbname: recsys
+  user: recsys
+  password: recsys123
+
+simulator:
+  user_pool_size: 5000
+  min_user_id: 10000000
+  max_user_id: 99999999
+
+  target_online_users: 10
+  max_online_users: 120
+
+  tick_seconds: 3.0
+  total_ticks: 3600
+
+  login_rate_per_tick: 10
+  logout_rate_per_tick: 5
+
+  global_event_rate_per_tick: 50
+  per_user_event_prob: 0.3
+
+  min_events_per_session: 1
+  max_events_per_session: 10
+
+  min_movie_id: 1
+  max_movie_id: 292757
+
+  min_watch_duration_seconds: 1
+  max_watch_duration_seconds: 5400
+
+# Incremental candidates request config
+incremental_request:
+  enabled: true           # Whether to enable incremental candidates requests
+  uri: "http://online_service:18080/candidates"  # The candidates API endpoint of the online service
+  interval_seconds: 2.0    # Fixed interval (if min/max_interval not set)
+  min_interval: 10       # Minimum interval (optional)
+  max_interval: 20        # Maximum interval (optional)
+  total_duration: 60.0     # Total duration (seconds)
+
+random_seed: 42
