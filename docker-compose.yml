@@ -83,6 +83,7 @@ services:
       PYICEBERG_CATALOG__DEFAULT__URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       PYICEBERG_CATALOG__DEFAULT__S3__ENDPOINT: http://minio:9000
       PYICEBERG_CATALOG__DEFAULT__WAREHOUSE: s3://warehouse/
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
 
   pipeline:
     build: ./pipeline

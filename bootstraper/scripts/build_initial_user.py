@@ -470,8 +470,8 @@ def process_single_user_arrays(
         stats["users_skipped_too_few"] = 1
         return None, None, None, None, stats
 
-    # 原始文件若已按 user_id, timestamp 排序，这里不需要重新排序
-    # 若你不完全确定 timestamp 也有序，可放开下面这段：
+    # The original dataset has sorted user id
+    # resort the timestamp per user
     order = np.argsort(timestamp_arr, kind="stable")
     user_id_arr = user_id_arr[order]
     movie_id_arr = movie_id_arr[order]
