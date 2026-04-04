@@ -1,0 +1,18 @@
+#! adminer-expose.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: adminer
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: adminer
+spec:
+    selector:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: adminer
+    ports:
+        - name: adminer-8080
+          port: 8080
+          targetPort: adminer-8080

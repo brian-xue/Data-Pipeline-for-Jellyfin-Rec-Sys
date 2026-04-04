@@ -1,0 +1,64 @@
+#! simulator-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: simulator
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: simulator
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+            com.docker.compose.service: simulator
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+                com.docker.compose.service: simulator
+                com.docker.compose.network.default: "true"
+        spec:
+            restartPolicy: unless-stopped
+            containers:
+                - name: simulator
+                  image: data-pipeline-for-jellyfin-rec-sys-simulator
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - tail
+                    - -f
+                    - /dev/null
+                  env:
+                    - name: BLOCK_STORE_MOUNT
+                      value: "/mnt/block"
+                    - name: KAGGLE_API_TOKEN
+                      value: "KGAT_1313fd2b2364e89b50fc70c6ca9ec15a"
+                    - name: MINIO_ENDPOINT
+                      value: "http://minio:9000"
+                    - name: MINIO_ROOT_PASSWORD
+                      value: "minioadmin123"
+                    - name: MINIO_ROOT_USER
+                      value: "minioadmin"
+                    - name: OBJECT_STORE_MOUNT
+                      value: "/mnt/object"
+                    - name: POSTGRES_DB
+                      value: "recsys"
+                    - name: POSTGRES_HOST
+                      value: "postgres"
+                    - name: POSTGRES_PASSWORD
+                      value: "recsys123"
+                    - name: POSTGRES_PORT
+                      value: "5432"
+                    - name: POSTGRES_USER
+                      value: "recsys"
+                  volumeMounts:
+                    - name: app
+                      mountPath: /app
+            volumes:
+                - name: app
+                  hostPath:
+                    path: /home/cc/Data-Pipeline-for-Jellyfin-Rec-Sys/simulator

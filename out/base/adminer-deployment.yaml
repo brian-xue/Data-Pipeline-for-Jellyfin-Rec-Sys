@@ -1,0 +1,35 @@
+#! adminer-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: adminer
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: adminer
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+            com.docker.compose.service: adminer
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+                com.docker.compose.service: adminer
+                com.docker.compose.network.default: "true"
+        spec:
+            containers:
+                - name: adminer
+                  image: adminer
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: ADMINER_DEFAULT_SERVER
+                      value: "postgres"
+                  ports:
+                    - name: adminer-8080
+                      containerPort: 8080

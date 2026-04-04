@@ -1,0 +1,26 @@
+#! kustomization.yaml
+# Generated code, do not edit
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+    - 0-data-pipeline-for-jellyfin-rec-sys-namespace.yaml
+    - adminer-deployment.yaml
+    - adminer-expose.yaml
+    - adminer-service.yaml
+    - api-deployment.yaml
+    - api-expose.yaml
+    - api-service.yaml
+    - bootstraper-deployment.yaml
+    - default-network-policy.yaml
+    - minio-deployment.yaml
+    - minio-expose.yaml
+    - minio-init-deployment.yaml
+    - minio-service.yaml
+    - online_service-deployment.yaml
+    - online_service-expose.yaml
+    - online_service-service.yaml
+    - pipeline-deployment.yaml
+    - postgres-deployment.yaml
+    - postgres-expose.yaml
+    - postgres-service.yaml
+    - simulator-deployment.yaml

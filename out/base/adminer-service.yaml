@@ -1,0 +1,23 @@
+# check if there is at least one published port
+
+#! adminer-service.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: adminer-published
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: adminer
+spec:
+    selector:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: adminer
+    ports:
+        - name: adminer-5050
+          port: 5050
+          protocol: TCP
+          targetPort: adminer-8080
+
+# check if there is at least one published port

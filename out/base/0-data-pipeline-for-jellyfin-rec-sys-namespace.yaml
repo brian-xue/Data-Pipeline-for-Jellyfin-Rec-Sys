@@ -1,0 +1,8 @@
+#! 0-data-pipeline-for-jellyfin-rec-sys-namespace.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Namespace
+metadata:
+    name: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys

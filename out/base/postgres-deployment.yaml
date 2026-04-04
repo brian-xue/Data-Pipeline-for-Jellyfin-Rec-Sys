@@ -1,0 +1,70 @@
+#! postgres-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: postgres
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: postgres
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+            com.docker.compose.service: postgres
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+                com.docker.compose.service: postgres
+                com.docker.compose.network.default: "true"
+        spec:
+            containers:
+                - name: postgres
+                  image: postgres:16
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: BLOCK_STORE_MOUNT
+                      value: "/mnt/block"
+                    - name: KAGGLE_API_TOKEN
+                      value: "KGAT_1313fd2b2364e89b50fc70c6ca9ec15a"
+                    - name: MINIO_ROOT_PASSWORD
+                      value: "minioadmin123"
+                    - name: MINIO_ROOT_USER
+                      value: "minioadmin"
+                    - name: OBJECT_STORE_MOUNT
+                      value: "/mnt/object"
+                    - name: POSTGRES_DB
+                      value: "recsys"
+                    - name: POSTGRES_PASSWORD
+                      value: "recsys123"
+                    - name: POSTGRES_USER
+                      value: "recsys"
+                  livenessProbe:
+                    exec:
+                        command:
+                            - /bin/sh
+                            - -c
+                            - pg_isready -U recsys -d recsys
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 5
+                  ports:
+                    - name: postgres-5432
+                      containerPort: 5432
+                  volumeMounts:
+                    - name: var-lib-postgresql-data
+                      mountPath: /var/lib/postgresql/data
+                    - name: docker-entrypoint-initdb-d
+                      mountPath: /docker-entrypoint-initdb.d
+            volumes:
+                - name: var-lib-postgresql-data
+                  hostPath:
+                    path: /mnt/block/postgres_data
+                - name: docker-entrypoint-initdb-d
+                  hostPath:
+                    path: /home/cc/Data-Pipeline-for-Jellyfin-Rec-Sys/db/init

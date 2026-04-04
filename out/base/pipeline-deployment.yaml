@@ -1,0 +1,89 @@
+#! pipeline-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: pipeline
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: pipeline
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+            com.docker.compose.service: pipeline
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+                com.docker.compose.service: pipeline
+                com.docker.compose.network.default: "true"
+        spec:
+            containers:
+                - name: pipeline
+                  image: data-pipeline-for-jellyfin-rec-sys-pipeline
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - tail
+                    - -f
+                    - /dev/null
+                  workingDir: /app
+                  env:
+                    - name: ARTIFACTS_PATH
+                      value: "/data/artifacts"
+                    - name: BLOCK_STORE_MOUNT
+                      value: "/mnt/block"
+                    - name: KAGGLE_API_TOKEN
+                      value: "KGAT_1313fd2b2364e89b50fc70c6ca9ec15a"
+                    - name: MINIO_ENDPOINT
+                      value: "http://minio:9000"
+                    - name: MINIO_ROOT_PASSWORD
+                      value: "minioadmin123"
+                    - name: MINIO_ROOT_USER
+                      value: "minioadmin"
+                    - name: OBJECT_STORE_MOUNT
+                      value: "/mnt/object"
+                    - name: POSTGRES_DB
+                      value: "recsys"
+                    - name: POSTGRES_HOST
+                      value: "postgres"
+                    - name: POSTGRES_PASSWORD
+                      value: "recsys123"
+                    - name: POSTGRES_USER
+                      value: "recsys"
+                  volumeMounts:
+                    - name: data-artifacts
+                      mountPath: /data/artifacts
+                    - name: data-cache
+                      mountPath: /data/cache
+                    - name: data-warehouse
+                      mountPath: /data/warehouse
+                    - name: data
+                      mountPath: /data
+                    - name: data-tmp
+                      mountPath: /data/tmp
+                    - name: app
+                      mountPath: /app
+            volumes:
+                - name: data-artifacts
+                  hostPath:
+                    path: /mnt/object/minio_data/artifacts
+                - name: data-cache
+                  hostPath:
+                    path: /mnt/block/cache
+                - name: data-warehouse
+                  hostPath:
+                    path: /mnt/object/minio_data/warehouse
+                - name: data
+                  hostPath:
+                    path: /mnt/object/minio_data
+                - name: data-tmp
+                  hostPath:
+                    path: /mnt/object/tmp
+                - name: app
+                  hostPath:
+                    path: /home/cc/Data-Pipeline-for-Jellyfin-Rec-Sys/pipeline

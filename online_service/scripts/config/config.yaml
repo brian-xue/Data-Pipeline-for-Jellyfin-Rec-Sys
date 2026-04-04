@@ -17,7 +17,7 @@ processor_intervals:
   event_processor_seconds: 200
   popular_movie_updater_seconds: 300
   user_embedding_updater_seconds: 800
-  exporter_seconds: 40
+  exporter_seconds: 100
 
 embedding:
   recent_events_limit: 200
@@ -45,6 +45,6 @@ exporter:
   write_parquet: true
 
 api:
-  enabled: true
+  enabled: false
   host: 0.0.0.0
   port: 18080

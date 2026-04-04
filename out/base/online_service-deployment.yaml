@@ -1,0 +1,81 @@
+#! online_service-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: online-service
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: online_service
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+            com.docker.compose.service: online_service
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+                com.docker.compose.service: online_service
+                com.docker.compose.network.default: "true"
+        spec:
+            containers:
+                - name: online-service
+                  image: data-pipeline-for-jellyfin-rec-sys-online_service
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - gunicorn
+                    - -w
+                    - 2
+                    - -b
+                    - 0.0.0.0:18080
+                    - scripts.api.candidate_api:create_app()
+                  env:
+                    - name: BLOCK_STORE_MOUNT
+                      value: "/mnt/block"
+                    - name: KAGGLE_API_TOKEN
+                      value: "KGAT_1313fd2b2364e89b50fc70c6ca9ec15a"
+                    - name: MINIO_ENDPOINT
+                      value: "http://minio:9000"
+                    - name: MINIO_ROOT_PASSWORD
+                      value: "minioadmin123"
+                    - name: MINIO_ROOT_USER
+                      value: "minioadmin"
+                    - name: OBJECT_STORE_MOUNT
+                      value: "/mnt/object"
+                    - name: POSTGRES_DB
+                      value: "recsys"
+                    - name: POSTGRES_HOST
+                      value: "postgres"
+                    - name: POSTGRES_PASSWORD
+                      value: "recsys123"
+                    - name: POSTGRES_PORT
+                      value: "5432"
+                    - name: POSTGRES_USER
+                      value: "recsys"
+                  ports:
+                    - name: online-se-18080
+                      containerPort: 18080
+                  volumeMounts:
+                    - name: data-artifacts
+                      mountPath: /data/artifacts
+                      readOnly: true
+                    - name: data-embedding
+                      mountPath: /data/embedding
+                    - name: app
+                      mountPath: /app
+            volumes:
+                - name: data-artifacts
+                  hostPath:
+                    path: /mnt/block/artifacts
+                  readOnly: true
+                - name: data-embedding
+                  hostPath:
+                    path: /mnt/block/embedding
+                - name: app
+                  hostPath:
+                    path: /home/cc/Data-Pipeline-for-Jellyfin-Rec-Sys/online_service

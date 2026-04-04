@@ -1,0 +1,69 @@
+#! minio-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: minio
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: minio
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+            com.docker.compose.service: minio
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+                com.docker.compose.service: minio
+                com.docker.compose.network.default: "true"
+        spec:
+            containers:
+                - name: minio
+                  image: minio/minio:latest
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - server
+                    - /data
+                    - --console-address
+                    - :9001
+                  env:
+                    - name: BLOCK_STORE_MOUNT
+                      value: "/mnt/block"
+                    - name: KAGGLE_API_TOKEN
+                      value: "KGAT_1313fd2b2364e89b50fc70c6ca9ec15a"
+                    - name: MINIO_ROOT_PASSWORD
+                      value: "minioadmin123"
+                    - name: MINIO_ROOT_USER
+                      value: "minioadmin"
+                    - name: OBJECT_STORE_MOUNT
+                      value: "/mnt/object"
+                    - name: POSTGRES_DB
+                      value: "recsys"
+                    - name: POSTGRES_PASSWORD
+                      value: "recsys123"
+                    - name: POSTGRES_USER
+                      value: "recsys"
+                  livenessProbe:
+                    exec:
+                        command: ['curl -f http://localhost:9000/minio/health/live']
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 5
+                  ports:
+                    - name: minio-9000
+                      containerPort: 9000
+                    - name: minio-9001
+                      containerPort: 9001
+                  volumeMounts:
+                    - name: data
+                      mountPath: /data
+            volumes:
+                - name: data
+                  hostPath:
+                    path: /mnt/object/minio_data

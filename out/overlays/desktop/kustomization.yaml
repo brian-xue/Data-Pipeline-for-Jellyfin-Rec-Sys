@@ -1,0 +1,12 @@
+#! kustomization.yaml
+# Generated code, do not edit
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+    - ../../base
+patches:
+    - path: adminer-service.yaml
+    - path: api-service.yaml
+    - path: minio-service.yaml
+    - path: online_service-service.yaml
+    - path: postgres-service.yaml

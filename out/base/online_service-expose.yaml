@@ -1,0 +1,18 @@
+#! online_service-expose.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: online-service
+    namespace: data-pipeline-for-jellyfin-rec-sys
+    labels:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: online_service
+spec:
+    selector:
+        com.docker.compose.project: data-pipeline-for-jellyfin-rec-sys
+        com.docker.compose.service: online_service
+    ports:
+        - name: online-se-18080
+          port: 18080
+          targetPort: online-se-18080
