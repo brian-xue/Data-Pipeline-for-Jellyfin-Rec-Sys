@@ -110,6 +110,25 @@ services:
       ARTIFACTS_PATH: /data/artifacts
 
   # --- APPLICATION LAYER ---
+  api:
+    build: ./api
+    container_name: api
+    env_file: .env
+    ports:
+      - "18081:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./api:/app
+    command: gunicorn -w 2 -b 0.0.0.0:8080 "scripts.app:create_app()"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
   online_service:
     build: ./online_service
     container_name: online_service
@@ -136,9 +155,9 @@ services:
     build: ./simulator
     container_name: simulator
     env_file: .env
-    # depends_on:
-    #   api:
-    #     condition: service_healthy
+    depends_on:
+      api:
+        condition: service_started
     restart: unless-stopped
     command: tail -f /dev/null
     volumes:
