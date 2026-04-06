@@ -21,34 +21,6 @@ The project is organized around a few connected services:
 4. `online_service` reads those events, updates user state, exports snapshots, and serves `/candidates`.
 5. `pipeline/run_online.sh` converts exported online data into online training datasets.
 
-## Quick Start
-
-Start the shared infrastructure and services:
-
-```bash
-docker compose up --build
-```
-
-Run the initial offline preparation:
-
-```bash
-bash run_offline_part.sh
-```
-
-Run the simulator manually:
-
-```bash
-docker compose exec simulator python scripts/main.py --config scripts/config.yaml
-```
-
-Useful local endpoints:
-
-- `http://localhost:18080/health`: online service health
-- `http://localhost:18080/candidates?user_id=10000001&top_k=10`: candidate API
-- `http://localhost:18081/health`: ingest API health
-- `http://localhost:5050`: Adminer
-- `http://localhost:9001`: MinIO console
-
 ## Repository Structure
 
 ```text
