@@ -3,9 +3,11 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import time
+
+import numpy as np
 
 from scripts.services.export_service import export_rows_to_parquet, write_json
-import time
 
 from scripts.db.connection import get_connection
 from scripts.repositories.checkpoint_repository import CheckpointRepository
@@ -21,7 +23,6 @@ from scripts.utils.logger import get_logger
 LOGGER = get_logger("online_service.user_embedding_updater")
 JOB_NAME = "online_service_user_embedding"
 
-
 @dataclass
 class UserEmbeddingUpdate:
     user_id: int
@@ -35,14 +36,63 @@ class UserEmbeddingUpdater:
     def __init__(self, config):
         self.config = config
         self.interval_seconds = config.processor_intervals.user_embedding_updater_seconds
+        self._movie_embeddings: np.ndarray | None = None
+        self._movie_id_to_index: dict[int, int] = {}
+        self._embedding_dim: int | None = None
         LOGGER.info("UserEmbeddingUpdater interval configured: %s seconds", self.interval_seconds)
 
     def collect_affected_users(self, event_repo: UserEventRepository, last_user_event_id: int) -> list[int]:
         return event_repo.fetch_affected_user_ids_after(last_user_event_id)
 
-    def _mock_movie_embedding(self, movie_id: int) -> list[float]:
-        base = float(movie_id % 1000) / 1000.0
-        return [base, base / 2.0, base / 3.0, base / 4.0]
+    def _ensure_movie_embeddings_loaded(self) -> None:
+        if self._movie_embeddings is not None:
+            return
+
+        candidate_cfg = self.config.candidate
+        ids_path = candidate_cfg.movie_ids_path
+        if not ids_path:
+            raise ValueError("candidate.movie_ids_path is required for user embedding computation")
+
+        embeddings = np.load(candidate_cfg.movie_embeddings_npy_path).astype(np.float32)
+        ids = np.load(ids_path)
+
+        if embeddings.ndim != 2:
+            raise ValueError(
+                f"movie embeddings must be 2D, got shape={embeddings.shape} "
+                f"from path={candidate_cfg.movie_embeddings_npy_path}"
+            )
+        if len(ids) != embeddings.shape[0]:
+            raise ValueError(
+                f"ids size ({len(ids)}) does not match embeddings rows ({embeddings.shape[0]})"
+            )
+
+        movie_id_to_index: dict[int, int] = {}
+        duplicate_count = 0
+        for index, movie_id in enumerate(ids):
+            movie_id_int = int(movie_id)
+            if movie_id_int in movie_id_to_index:
+                duplicate_count += 1
+                continue
+            movie_id_to_index[movie_id_int] = index
+
+        self._movie_embeddings = embeddings
+        self._movie_id_to_index = movie_id_to_index
+        self._embedding_dim = int(embeddings.shape[1])
+        LOGGER.info(
+            "Loaded movie embeddings from %s (rows=%s, dim=%s, ids=%s, duplicates_ignored=%s)",
+            candidate_cfg.movie_embeddings_npy_path,
+            embeddings.shape[0],
+            embeddings.shape[1],
+            len(movie_id_to_index),
+            duplicate_count,
+        )
+
+    def _get_movie_embedding(self, movie_id: int) -> list[float] | None:
+        self._ensure_movie_embeddings_loaded()
+        index = self._movie_id_to_index.get(int(movie_id))
+        if index is None or self._movie_embeddings is None:
+            return None
+        return self._movie_embeddings[index].tolist()
 
     def _join(self, *parts: str) -> str:
         cleaned = [p.strip("/") for p in parts if p]
@@ -190,9 +240,26 @@ class UserEmbeddingUpdater:
 
         movie_embeddings: list[list[float]] = []
         weights: list[float] = []
+        missing_movie_count = 0
         for row in rows:
-            movie_embeddings.append(self._mock_movie_embedding(int(row["movie_id"])))
+            movie_id = int(row["movie_id"])
+            movie_embedding = self._get_movie_embedding(movie_id)
+            if movie_embedding is None:
+                missing_movie_count += 1
+                continue
+            movie_embeddings.append(movie_embedding)
             weights.append(max(float(row["watch_duration_seconds"]), self.config.embedding.min_watch_duration_seconds))
+
+        if missing_movie_count > 0:
+            LOGGER.warning(
+                "Skipped %s events due to missing movie embeddings for user_id=%s",
+                missing_movie_count,
+                user_id,
+            )
+
+        if not movie_embeddings:
+            LOGGER.warning("No valid movie embeddings found for user_id=%s", user_id)
+            return None
 
         vector = compute_weighted_user_embedding(movie_embeddings, weights)
         if vector is None:
