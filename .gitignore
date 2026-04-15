@@ -3,3 +3,4 @@ local_data/
 __pycache__/
 *.pyc
 checkpoints/
+.DS_Store
