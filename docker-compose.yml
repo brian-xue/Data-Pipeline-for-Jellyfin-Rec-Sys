@@ -162,6 +162,7 @@ services:
     command: tail -f /dev/null
     volumes:
       - ./simulator:/app
+      - /mnt/block/embedding:/data/embedding
     environment:
       POSTGRES_HOST: postgres
       MINIO_ENDPOINT: http://minio:9000
