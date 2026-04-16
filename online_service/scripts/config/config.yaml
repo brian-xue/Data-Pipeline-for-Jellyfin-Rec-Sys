@@ -13,10 +13,10 @@ object_storage:
   secret_key: minioadmin123
 
 processor_intervals:
-  auth_processor_seconds: 200
-  event_processor_seconds: 200
-  popular_movie_updater_seconds: 300
-  user_embedding_updater_seconds: 800
+  auth_processor_seconds: 2
+  event_processor_seconds: 2
+  popular_movie_updater_seconds: 100
+  user_embedding_updater_seconds: 60
   exporter_seconds: 100
 
 embedding:
@@ -30,7 +30,7 @@ candidate:
   popular_fallback_k: 20
   movie_embeddings_npy_path: /data/embedding/embedding.npy
   movie_embedding_index_path: /data/embedding/faiss.index
-  movie_ids_path: /data/embedding/movie_ids.npy
+  movie_ids_path: /data/embedding/ids.npy
   hnsw_m: 32
   hnsw_ef_search: 64
 

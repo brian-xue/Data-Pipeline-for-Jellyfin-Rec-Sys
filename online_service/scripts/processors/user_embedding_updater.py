@@ -251,14 +251,15 @@ class UserEmbeddingUpdater:
             weights.append(max(float(row["watch_duration_seconds"]), self.config.embedding.min_watch_duration_seconds))
 
         if missing_movie_count > 0:
-            LOGGER.warning(
-                "Skipped %s events due to missing movie embeddings for user_id=%s",
-                missing_movie_count,
-                user_id,
-            )
+            # LOGGER.warning(
+            #     "Skipped %s events due to missing movie embeddings for user_id=%s",
+            #     missing_movie_count,
+            #     user_id,
+            # )
+            pass
 
         if not movie_embeddings:
-            LOGGER.warning("No valid movie embeddings found for user_id=%s", user_id)
+            # LOGGER.warning("No valid movie embeddings found for user_id=%s", user_id)
             return None
 
         vector = compute_weighted_user_embedding(movie_embeddings, weights)
