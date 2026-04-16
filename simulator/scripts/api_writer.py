@@ -64,13 +64,26 @@ class ApiEventWriter:
             "user_events": self.user_events,
         }
 
-        response = requests.post(
-            self.endpoint,
-            json=payload,
-            timeout=self.timeout_seconds,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Ingest API failed: {response.status_code} {response.text}")
+        def _post_once() -> None:
+            response = requests.post(
+                self.endpoint,
+                json=payload,
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(f"Ingest API failed: {response.status_code} {response.text}")
+
+        try:
+            _post_once()
+        except Exception as first_error:
+            print(f"[ingest commit] first attempt failed: {first_error}; retrying once")
+            try:
+                _post_once()
+            except Exception as second_error:
+                print(f"[ingest commit] retry failed, dropping current batch: {second_error}")
+                self.auth_events.clear()
+                self.user_events.clear()
+                return
 
         self.auth_events.clear()
         self.user_events.clear()

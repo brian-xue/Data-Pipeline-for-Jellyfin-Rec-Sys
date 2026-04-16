@@ -21,6 +21,8 @@ class SimulatorConfig:
     user_pool_size: int
     min_user_id: int
     max_user_id: int
+    base_profile_path: str | None
+    online_user_sample_size: int
     target_online_users: int
     max_online_users: int
     tick_seconds: float
@@ -35,6 +37,25 @@ class SimulatorConfig:
     max_movie_id: int
     min_watch_duration_seconds: float
     max_watch_duration_seconds: float
+    movie_embeddings_npy_path: str
+    movie_ids_path: str
+    random_movie_injection_ratio: float
+    candidate_request_top_k: int
+    candidate_request_timeout_seconds: float
+    memory_cleanup_every_ticks: int
+    event_count_min: int
+    event_count_max: int
+    short_event_count_min: int
+    short_event_count_max: int
+    short_watch_duration_min_seconds: int
+    short_watch_duration_max_seconds: int
+    long_watch_duration_min_seconds: int
+    long_watch_duration_max_seconds: int
+    ranking_noise_min: float
+    ranking_noise_max: float
+    candidate_top_pool_min_size: int
+    candidate_tail_pool_min_size: int
+    candidate_pool_multiplier: int
 
 
 @dataclass(frozen=True)
@@ -88,6 +109,8 @@ def load_config(path: str) -> AppConfig:
         user_pool_size=int(_deep_get(raw, ["simulator", "user_pool_size"], 5000)),
         min_user_id=int(_deep_get(raw, ["simulator", "min_user_id"], 10000000)),
         max_user_id=int(_deep_get(raw, ["simulator", "max_user_id"], 99999999)),
+        base_profile_path=_deep_get(raw, ["simulator", "base_profile_path"], "s3://artifacts/simulator_base_profile/simulator_base_profile.parquet"),
+        online_user_sample_size=int(_deep_get(raw, ["simulator", "online_user_sample_size"], 100)),
         target_online_users=int(_deep_get(raw, ["simulator", "target_online_users"], 100)),
         max_online_users=int(_deep_get(raw, ["simulator", "max_online_users"], 120)),
         tick_seconds=float(_deep_get(raw, ["simulator", "tick_seconds"], 1.0)),
@@ -102,6 +125,25 @@ def load_config(path: str) -> AppConfig:
         max_movie_id=int(_deep_get(raw, ["simulator", "max_movie_id"], 292757)),
         min_watch_duration_seconds=float(_deep_get(raw, ["simulator", "min_watch_duration_seconds"], 60.0)),
         max_watch_duration_seconds=float(_deep_get(raw, ["simulator", "max_watch_duration_seconds"], 7200.0)),
+        movie_embeddings_npy_path=str(_deep_get(raw, ["simulator", "movie_embeddings_npy_path"], "/data/embedding/embedding.npy")),
+        movie_ids_path=str(_deep_get(raw, ["simulator", "movie_ids_path"], "/data/embedding/ids.npy")),
+        random_movie_injection_ratio=float(_deep_get(raw, ["simulator", "random_movie_injection_ratio"], 0.1)),
+        candidate_request_top_k=int(_deep_get(raw, ["simulator", "candidate_request_top_k"], 20)),
+        candidate_request_timeout_seconds=float(_deep_get(raw, ["simulator", "candidate_request_timeout_seconds"], 10.0)),
+        memory_cleanup_every_ticks=int(_deep_get(raw, ["simulator", "memory_cleanup_every_ticks"], 20)),
+        event_count_min=int(_deep_get(raw, ["simulator", "event_count_min"], 1)),
+        event_count_max=int(_deep_get(raw, ["simulator", "event_count_max"], 5)),
+        short_event_count_min=int(_deep_get(raw, ["simulator", "short_event_count_min"], 0)),
+        short_event_count_max=int(_deep_get(raw, ["simulator", "short_event_count_max"], 2)),
+        short_watch_duration_min_seconds=int(_deep_get(raw, ["simulator", "short_watch_duration_min_seconds"], 1)),
+        short_watch_duration_max_seconds=int(_deep_get(raw, ["simulator", "short_watch_duration_max_seconds"], 599)),
+        long_watch_duration_min_seconds=int(_deep_get(raw, ["simulator", "long_watch_duration_min_seconds"], 600)),
+        long_watch_duration_max_seconds=int(_deep_get(raw, ["simulator", "long_watch_duration_max_seconds"], 7200)),
+        ranking_noise_min=float(_deep_get(raw, ["simulator", "ranking_noise_min"], -0.01)),
+        ranking_noise_max=float(_deep_get(raw, ["simulator", "ranking_noise_max"], 0.01)),
+        candidate_top_pool_min_size=int(_deep_get(raw, ["simulator", "candidate_top_pool_min_size"], 10)),
+        candidate_tail_pool_min_size=int(_deep_get(raw, ["simulator", "candidate_tail_pool_min_size"], 10)),
+        candidate_pool_multiplier=int(_deep_get(raw, ["simulator", "candidate_pool_multiplier"], 3)),
     )
 
     random_seed = int(_deep_get(raw, ["random_seed"], 42))

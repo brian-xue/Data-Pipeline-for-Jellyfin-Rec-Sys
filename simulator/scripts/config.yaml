@@ -9,8 +9,10 @@ simulator:
   user_pool_size: 5000
   min_user_id: 10000000
   max_user_id: 99999999
+  base_profile_path: s3://artifacts/simulator_base_profile/simulator_base_profile.parquet
+  online_user_sample_size: 120
 
-  target_online_users: 40
+  target_online_users: 10
   max_online_users: 120
 
   tick_seconds: 3.0
@@ -30,15 +32,32 @@ simulator:
 
   min_watch_duration_seconds: 1
   max_watch_duration_seconds: 5400
+  movie_embeddings_npy_path: /data/embedding/embedding.npy
+  movie_ids_path: /data/embedding/ids.npy
+  random_movie_injection_ratio: 0.1
+  candidate_request_top_k: 20
+  candidate_request_timeout_seconds: 10.0
+  memory_cleanup_every_ticks: 20
+  event_count_min: 1
+  event_count_max: 5
+  short_event_count_min: 0
+  short_event_count_max: 2
+  short_watch_duration_min_seconds: 1
+  short_watch_duration_max_seconds: 599
+  long_watch_duration_min_seconds: 600
+  long_watch_duration_max_seconds: 7200
+  ranking_noise_min: -0.01
+  ranking_noise_max: 0.01
+  candidate_top_pool_min_size: 10
+  candidate_tail_pool_min_size: 10
+  candidate_pool_multiplier: 3
 
 # Incremental candidates request config
 incremental_request:
-  enabled: false           # Whether to enable incremental candidates requests
+  enabled: true           # Whether to enable incremental candidates requests
   uri: "http://online_service:18080/candidates"  # The candidates API endpoint of the online service
-  interval_seconds: 2.0    # Fixed interval (if min/max_interval not set)
-  min_interval: 10       # Minimum interval (optional)
-  max_interval: 20        # Maximum interval (optional)
-  total_duration: 60.0     # Total duration (seconds)
+  top_k: 20
+  timeout_seconds: 10.0
 
 ingest_api:
   enabled: true

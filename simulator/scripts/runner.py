@@ -1,55 +1,44 @@
 from __future__ import annotations
 
+import gc
 import random
 
 from api_writer import ApiEventWriter
 from config import AppConfig
 from db.client import create_session_factory
 from db.writer import EventWriter
-from generators.user_pool import generate_user_pool
+from generators.user_pool import build_simulator_user_pool
 
 from scheduler import TickScheduler
 from service.simulator_service import SimulatorService
 from state import SimulatorState
-from incremental_request import incremental_candidate_request
 
 
 def run_simulation(cfg: AppConfig) -> None:
 	random.seed(cfg.random_seed)
 
-	user_pool = generate_user_pool(
-		user_pool_size=cfg.simulator.user_pool_size,
-		min_user_id=cfg.simulator.min_user_id,
-		max_user_id=cfg.simulator.max_user_id,
-		random_seed=cfg.random_seed,
-	)
-
 	def _run_with_writer(writer: EventWriter | ApiEventWriter) -> None:
-		state = SimulatorState(
-			online_users=set(),
-			offline_users=set(user_pool),
-			runtime_by_user={},
+		online_users, offline_users, user_embeddings_by_id = build_simulator_user_pool(
+			profile_path=cfg.simulator.base_profile_path,
+			online_user_sample_size=cfg.simulator.online_user_sample_size,
+			fallback_user_pool_size=cfg.simulator.user_pool_size,
+			min_user_id=cfg.simulator.min_user_id,
+			max_user_id=cfg.simulator.max_user_id,
+			random_seed=cfg.random_seed,
 		)
-		service = SimulatorService(cfg=cfg.simulator, state=state, writer=writer)
+		state = SimulatorState(
+			online_users=set(online_users),
+			offline_users=set(offline_users),
+			runtime_by_user={},
+			user_embeddings_by_id=user_embeddings_by_id,
+		)
+		service = SimulatorService(
+			cfg=cfg.simulator,
+			state=state,
+			writer=writer,
+			incremental_request_cfg=cfg.incremental_request,
+		)
 		scheduler = TickScheduler(cfg.simulator.tick_seconds)
-
-		inc_cfg = cfg.incremental_request or {}
-		if inc_cfg.get("enabled", False):
-			import threading
-			threading.Thread(
-				target=incremental_candidate_request,
-				args=(
-					state,
-					inc_cfg.get("interval_seconds", 2.0),
-					inc_cfg.get("total_duration", 60.0),
-					inc_cfg.get("uri", "http://localhost:8000/api/candidates")
-				),
-				kwargs={
-					"min_interval": inc_cfg.get("min_interval"),
-					"max_interval": inc_cfg.get("max_interval")
-				},
-				daemon=True
-			).start()
 
 		def _tick(tick_index: int) -> None:
 			stats = service.run_tick()
@@ -59,6 +48,8 @@ def run_simulation(cfg: AppConfig) -> None:
 				f"emitted={stats['emitted_events']} "
 				f"logged_out={stats['logged_out']} online={stats['online_users']}"
 			)
+			if cfg.simulator.memory_cleanup_every_ticks > 0 and tick_index % cfg.simulator.memory_cleanup_every_ticks == 0:
+				gc.collect()
 
 		try:
 			scheduler.run(total_ticks=cfg.simulator.total_ticks, tick_fn=_tick)
