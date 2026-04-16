@@ -1,0 +1,12 @@
+job:
+  name: build_simulator_base_profile
+
+input:
+  base_user_profiles_path: s3://artifacts/bootstraper_v0_embedding/base_user_profiles.parquet
+
+output:
+  base_dir: s3://artifacts/simulator_base_profile
+  writer_flush_rows: 50000
+
+artifact:
+  manifest_path: s3://artifacts/simulator_base_profile/manifest.json
