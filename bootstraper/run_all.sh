@@ -18,4 +18,7 @@ python3 scripts/build_embedding_index.py
 echo "[STEP] build_initial_user"
 python3 scripts/build_initial_user.py --config scripts/config.yaml
 
+echo "[STEP] build_simulator_profile"
+python3 scripts/build_simulator_base_profile.py --config scripts/config_simulator_profile.yaml
+
 echo "[DONE] bootstraper pipeline finished"
