@@ -39,7 +39,7 @@ sudo sed -i '/^#user_allow_other/s/^#//' /etc/fuse.conf
 mkdir -p ~/.config/rclone
 
 echo "Now configuring rclone for the object storage, MAKE SURE TO REPLACE THE PLACEHOLDERS WITH YOUR ACTUAL ACCESS KEY, SECRET KEY."
-cat <<EOF > rclone.conf
+cat <<EOF > ~/.config/rclone/rclone.conf
 [rclone_s3]
 type = s3
 provider = Ceph
@@ -57,7 +57,7 @@ sudo mkdir -p /mnt/object
 sudo chown -R cc /mnt/object
 sudo chgrp -R cc /mnt/object
 
-rclone mount ObjStore_proj25 /mnt/object \
+rclone mount rclone_s3:ObjStore_proj25 /mnt/object \
   --allow-other \
   --vfs-cache-mode off \
   --dir-cache-time 10s \
