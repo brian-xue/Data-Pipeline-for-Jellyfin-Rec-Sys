@@ -44,6 +44,10 @@ exporter:
   user_events_prefix: user_events
   write_parquet: true
 
+monitoring:
+  window_minutes: 5
+  short_watch_threshold_seconds: 10.0
+
 api:
   enabled: false
   host: 0.0.0.0

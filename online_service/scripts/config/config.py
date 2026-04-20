@@ -105,6 +105,12 @@ class ExporterConfig:
 
 
 @dataclass(frozen=True)
+class MonitoringConfig:
+	window_minutes: int = 5
+	short_watch_threshold_seconds: float = 10.0
+
+
+@dataclass(frozen=True)
 class ApiConfig:
 	host: str = "0.0.0.0"
 	port: int = 18080
@@ -120,6 +126,7 @@ class OnlineServiceConfig:
 	candidate: CandidateConfig
 	user_history_query: UserHistoryQueryConfig
 	exporter: ExporterConfig
+	monitoring: MonitoringConfig
 	api: ApiConfig
 
 
@@ -336,6 +343,23 @@ def load_online_service_config(config_path: str | None = None) -> OnlineServiceC
 		),
 	)
 
+	monitoring = MonitoringConfig(
+		window_minutes=int(
+			_deep_get(
+				yaml_cfg,
+				["monitoring", "window_minutes"],
+				_get_env_int("MONITORING_WINDOW_MINUTES", 5),
+			)
+		),
+		short_watch_threshold_seconds=float(
+			_deep_get(
+				yaml_cfg,
+				["monitoring", "short_watch_threshold_seconds"],
+				_get_env_float("MONITORING_SHORT_WATCH_THRESHOLD_SECONDS", 10.0),
+			)
+		),
+	)
+
 	api = ApiConfig(
 		host=str(_deep_get(yaml_cfg, ["api", "host"], os.getenv("API_HOST", "0.0.0.0"))),
 		port=int(_deep_get(yaml_cfg, ["api", "port"], _get_env_int("API_PORT", 18080))),
@@ -356,5 +380,6 @@ def load_online_service_config(config_path: str | None = None) -> OnlineServiceC
 		candidate=candidate,
 		user_history_query=user_history_query,
 		exporter=exporter,
+		monitoring=monitoring,
 		api=api,
 	)

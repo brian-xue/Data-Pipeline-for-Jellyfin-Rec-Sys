@@ -112,6 +112,15 @@ CREATE TABLE IF NOT EXISTS service_checkpoints (
     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+CREATE TABLE IF NOT EXISTS online_event_stats (
+    window_start_time TIMESTAMPTZ PRIMARY KEY,
+    window_end_time TIMESTAMPTZ NOT NULL,
+    total_count BIGINT NOT NULL DEFAULT 0,
+    abnormal_count BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 
 INSERT INTO service_checkpoints (job_name)
 VALUES
@@ -176,6 +185,10 @@ ALTER TABLE user_events
 ALTER TABLE users
     ADD CONSTRAINT chk_users_login_count
     CHECK (login_count >= 0);
+
+ALTER TABLE online_event_stats
+    ADD CONSTRAINT chk_online_event_stats_non_negative
+    CHECK (total_count >= 0 AND abnormal_count >= 0 AND abnormal_count <= total_count);
 
 -- ALTER TABLE session_events
 --     ADD CONSTRAINT chk_session_events_event_type
