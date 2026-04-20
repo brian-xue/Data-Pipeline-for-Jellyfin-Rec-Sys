@@ -17,17 +17,17 @@ def select_candidates_for_user(user_id: int, top_k: int, config) -> Tuple[str, l
         if user_row is None or not user_row.get("embedding_uri"):
             print(f"[candidate selection] using popular movies for user_id={user_id}")
             popular_rows = popular_repo.fetch_popular_movies(limit=POPULAR_FALLBACK_COUNT)
-            return ("popular", retrieve_from_popular(popular_rows, top_k=min(POPULAR_FALLBACK_COUNT, len(popular_rows))))
+            return ("popular", retrieve_from_popular(popular_rows, top_k=min(POPULAR_FALLBACK_COUNT, len(popular_rows))), None)
 
         print(f"[candidate selection] using embedding for user_id={user_id}")
-        embedding_items = retrieve_by_embedding(
+        embedding_items, user_embedding = retrieve_by_embedding(
             user_id=user_id,
             user_embedding_uri=user_row.get("embedding_uri"),
             top_k=top_k,
             config=config,
         )
         if embedding_items:
-            return ("embedding", embedding_items)
+            return ("embedding", embedding_items, user_embedding)
 
         popular_rows = popular_repo.fetch_popular_movies(limit=POPULAR_FALLBACK_COUNT)
-        return ("popular", retrieve_from_popular(popular_rows, top_k=min(POPULAR_FALLBACK_COUNT, len(popular_rows))))
+        return ("popular", retrieve_from_popular(popular_rows, top_k=min(POPULAR_FALLBACK_COUNT, len(popular_rows))), None)

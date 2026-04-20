@@ -25,13 +25,14 @@ def create_app(config=None) -> Flask:
 
         try:
             user_id = int(user_id_raw)
-            category, items = select_candidates_for_user(user_id=user_id, top_k=top_k, config=cfg)
+            category, items, user_embedding = select_candidates_for_user(user_id=user_id, top_k=top_k, config=cfg)
             return jsonify({
                 "user_id": user_id,
                 "category": category,
                 "top_k": top_k,
                 "count": len(items),
                 "items": items,
+                "user_embedding": user_embedding,
             })
         except Exception as e:
             app.logger.exception("candidate selection failed for user_id=%s top_k=%s", user_id, top_k)

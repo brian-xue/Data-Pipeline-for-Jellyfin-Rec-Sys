@@ -157,8 +157,9 @@ def retrieve_by_embedding(user_id: int, user_embedding_uri: str | None, top_k: i
         results: list[dict[str, Any]] = []
         for rank, idx in enumerate(order, start=1):
             movie_id = int(movie_ids[idx]) if movie_ids is not None else int(idx)
-            results.append({"movie_id": movie_id, "score": float(scores[idx]), "rank": rank})
-        return results
+            movie_embedding = movie_embeddings[idx]
+            results.append({"movie_id": movie_id, "score": float(scores[idx]), "rank": rank, "embedding": movie_embedding.tolist()})
+        return results, user_embedding
 
     if faiss is not None:
         normalized_query = query.copy()
@@ -171,8 +172,9 @@ def retrieve_by_embedding(user_id: int, user_embedding_uri: str | None, top_k: i
                 continue
             movie_id = int(movie_ids[idx]) if movie_ids is not None else int(idx)
             score = 1.0 - float(distance) / 2.0
-            results.append({"movie_id": movie_id, "score": score,  "rank": rank})
-        return results
+            movie_embedding = movie_embeddings[idx]
+            results.append({"movie_id": movie_id, "score": score,  "rank": rank, "embedding": movie_embedding.tolist()})
+        return results, user_embedding
 
     return []
 
